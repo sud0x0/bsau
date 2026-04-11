@@ -1,0 +1,5 @@
+# Semgrep ignore file
+# See: https://semgrep.dev/docs/ignoring-files-folders-code/
+
+# Test data - intentionally contains malicious patterns for testing
+testdata/
