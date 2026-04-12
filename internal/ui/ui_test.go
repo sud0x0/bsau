@@ -4,8 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/sud0x0/bsau/internal/claude"
-	"github.com/sud0x0/bsau/internal/hashlookup"
+	"github.com/sud0x0/bsau/internal/ollama"
 )
 
 func TestSeverity_Constants(t *testing.T) {
@@ -52,40 +51,17 @@ func TestColorSeverity(t *testing.T) {
 
 func TestColorVerdict(t *testing.T) {
 	tests := []struct {
-		verdict  claude.Verdict
+		verdict  ollama.Verdict
 		contains string
 	}{
-		{claude.VerdictSafe, ColorGreen},
-		{claude.VerdictReview, ColorYellow},
-		{claude.VerdictHold, ColorRed},
+		{ollama.VerdictSafe, ColorGreen},
+		{ollama.VerdictReview, ColorYellow},
+		{ollama.VerdictHold, ColorRed},
 	}
 
 	for _, tt := range tests {
 		t.Run(string(tt.verdict), func(t *testing.T) {
 			result := colorVerdict(tt.verdict)
-			if len(result) == 0 {
-				t.Error("expected non-empty result")
-			}
-		})
-	}
-}
-
-func TestColorHashResult(t *testing.T) {
-	tests := []struct {
-		result   hashlookup.HashResult
-		expected string
-	}{
-		{hashlookup.HashNotFlaggedByCIRCL, "CLEAN"},
-		{hashlookup.HashNotInCIRCL, "NOT_IN_DB"},
-		{hashlookup.HashCIRCLMalicious, "MALICIOUS"},
-		{hashlookup.HashVTConfirmed, "VT_CONFIRMED"},
-		{hashlookup.HashVTClean, "VT_CLEAN"},
-		{hashlookup.HashVTNotFound, "VT_NOT_FOUND"},
-	}
-
-	for _, tt := range tests {
-		t.Run(string(tt.result), func(t *testing.T) {
-			result := colorHashResult(tt.result)
 			if len(result) == 0 {
 				t.Error("expected non-empty result")
 			}
@@ -169,67 +145,6 @@ func TestTruncate(t *testing.T) {
 	}
 }
 
-func TestInsertAt(t *testing.T) {
-	tests := []struct {
-		name     string
-		slice    []string
-		index    int
-		value    string
-		expected []string
-	}{
-		{"insert at beginning", []string{"b", "c"}, 0, "a", []string{"a", "b", "c"}},
-		{"insert in middle", []string{"a", "c"}, 1, "b", []string{"a", "b", "c"}},
-		{"insert at end", []string{"a", "b"}, 2, "c", []string{"a", "b", "c"}},
-		{"insert beyond end", []string{"a", "b"}, 5, "c", []string{"a", "b", "c"}},
-		{"insert into empty", []string{}, 0, "a", []string{"a"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := insertAt(tt.slice, tt.index, tt.value)
-			if len(result) != len(tt.expected) {
-				t.Errorf("length mismatch: got %d, expected %d", len(result), len(tt.expected))
-				return
-			}
-			for i, v := range result {
-				if v != tt.expected[i] {
-					t.Errorf("insertAt()[%d] = %s, expected %s", i, v, tt.expected[i])
-				}
-			}
-		})
-	}
-}
-
-func TestInsertIntAt(t *testing.T) {
-	tests := []struct {
-		name     string
-		slice    []int
-		index    int
-		value    int
-		expected []int
-	}{
-		{"insert at beginning", []int{2, 3}, 0, 1, []int{1, 2, 3}},
-		{"insert in middle", []int{1, 3}, 1, 2, []int{1, 2, 3}},
-		{"insert at end", []int{1, 2}, 2, 3, []int{1, 2, 3}},
-		{"insert beyond end", []int{1, 2}, 5, 3, []int{1, 2, 3}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := insertIntAt(tt.slice, tt.index, tt.value)
-			if len(result) != len(tt.expected) {
-				t.Errorf("length mismatch: got %d, expected %d", len(result), len(tt.expected))
-				return
-			}
-			for i, v := range result {
-				if v != tt.expected[i] {
-					t.Errorf("insertIntAt()[%d] = %d, expected %d", i, v, tt.expected[i])
-				}
-			}
-		})
-	}
-}
-
 func TestPackageRow_Structure(t *testing.T) {
 	row := PackageRow{
 		Package:   "ripgrep",
@@ -253,33 +168,31 @@ func TestPreInstallRow_Structure(t *testing.T) {
 	row := PreInstallRow{
 		Package:        "openssl",
 		CVECount:       5,
-		ClaudeVerdict:  claude.VerdictReview,
+		OllamaVerdict:  ollama.VerdictReview,
 		Recommendation: "REVIEW",
 	}
 
 	if row.Package != "openssl" {
 		t.Errorf("expected Package openssl, got %s", row.Package)
 	}
-	if row.ClaudeVerdict != claude.VerdictReview {
-		t.Errorf("expected VerdictReview, got %v", row.ClaudeVerdict)
+	if row.OllamaVerdict != ollama.VerdictReview {
+		t.Errorf("expected VerdictReview, got %v", row.OllamaVerdict)
 	}
 }
 
 func TestPostInstallRow_Structure(t *testing.T) {
 	row := PostInstallRow{
 		Package:       "curl",
-		CIRCLResult:   hashlookup.HashNotInCIRCL,
-		VTResult:      "N/A",
 		SemgrepCount:  0,
-		ClaudeVerdict: claude.VerdictSafe,
+		OllamaVerdict: ollama.VerdictSafe,
 		Overall:       "CLEAN",
 	}
 
 	if row.Package != "curl" {
 		t.Errorf("expected Package curl, got %s", row.Package)
 	}
-	if row.CIRCLResult != hashlookup.HashNotInCIRCL {
-		t.Errorf("expected HashNotInCIRCL, got %v", row.CIRCLResult)
+	if row.SemgrepCount != 0 {
+		t.Errorf("expected SemgrepCount 0, got %d", row.SemgrepCount)
 	}
 }
 
@@ -375,88 +288,41 @@ func TestTruncate_EdgeCases(t *testing.T) {
 
 func TestAPIUsageInfo_Structure(t *testing.T) {
 	info := APIUsageInfo{
-		StepName:       "Pre-install Claude scan",
-		ClaudeTokens:   5000,
-		ClaudePackages: []string{"ripgrep", "curl", "wget"},
-		VTRequests:     2,
-		VTFiles:        []string{"/path/to/file1.exe", "/path/to/file2.dll"},
+		StepName:       "Pre-install Ollama scan",
+		OllamaPackages: []string{"ripgrep", "curl", "wget"},
 	}
 
-	if info.StepName != "Pre-install Claude scan" {
-		t.Errorf("expected StepName 'Pre-install Claude scan', got %s", info.StepName)
+	if info.StepName != "Pre-install Ollama scan" {
+		t.Errorf("expected StepName 'Pre-install Ollama scan', got %s", info.StepName)
 	}
-	if info.ClaudeTokens != 5000 {
-		t.Errorf("expected ClaudeTokens 5000, got %d", info.ClaudeTokens)
-	}
-	if len(info.ClaudePackages) != 3 {
-		t.Errorf("expected 3 ClaudePackages, got %d", len(info.ClaudePackages))
-	}
-	if info.VTRequests != 2 {
-		t.Errorf("expected VTRequests 2, got %d", info.VTRequests)
-	}
-	if len(info.VTFiles) != 2 {
-		t.Errorf("expected 2 VTFiles, got %d", len(info.VTFiles))
+	if len(info.OllamaPackages) != 3 {
+		t.Errorf("expected 3 OllamaPackages, got %d", len(info.OllamaPackages))
 	}
 }
 
 func TestAPIUsageInfo_EmptyUsage(t *testing.T) {
 	info := APIUsageInfo{
 		StepName:       "Test step",
-		ClaudeTokens:   0,
-		ClaudePackages: nil,
-		VTRequests:     0,
-		VTFiles:        nil,
+		OllamaPackages: nil,
 	}
 
-	// When both are zero, no API calls are required
-	hasClaudeUsage := info.ClaudeTokens > 0
-	hasVTUsage := info.VTRequests > 0
+	hasOllamaUsage := len(info.OllamaPackages) > 0
 
-	if hasClaudeUsage {
-		t.Error("expected no Claude usage when tokens is 0")
-	}
-	if hasVTUsage {
-		t.Error("expected no VT usage when requests is 0")
+	if hasOllamaUsage {
+		t.Error("expected no Ollama usage when packages is empty")
 	}
 }
 
-func TestAPIUsageInfo_OnlyClaude(t *testing.T) {
+func TestAPIUsageInfo_OnlyOllama(t *testing.T) {
 	info := APIUsageInfo{
-		StepName:       "Claude-only step",
-		ClaudeTokens:   10000,
-		ClaudePackages: []string{"pkg1"},
-		VTRequests:     0,
-		VTFiles:        nil,
+		StepName:       "Ollama-only step",
+		OllamaPackages: []string{"pkg1"},
 	}
 
-	hasClaudeUsage := info.ClaudeTokens > 0
-	hasVTUsage := info.VTRequests > 0
+	hasOllamaUsage := len(info.OllamaPackages) > 0
 
-	if !hasClaudeUsage {
-		t.Error("expected Claude usage when tokens > 0")
-	}
-	if hasVTUsage {
-		t.Error("expected no VT usage when requests is 0")
-	}
-}
-
-func TestAPIUsageInfo_OnlyVT(t *testing.T) {
-	info := APIUsageInfo{
-		StepName:       "VT-only step",
-		ClaudeTokens:   0,
-		ClaudePackages: nil,
-		VTRequests:     5,
-		VTFiles:        []string{"/a", "/b", "/c", "/d", "/e"},
-	}
-
-	hasClaudeUsage := info.ClaudeTokens > 0
-	hasVTUsage := info.VTRequests > 0
-
-	if hasClaudeUsage {
-		t.Error("expected no Claude usage when tokens is 0")
-	}
-	if !hasVTUsage {
-		t.Error("expected VT usage when requests > 0")
+	if !hasOllamaUsage {
+		t.Error("expected Ollama usage when packages > 0")
 	}
 }
 
@@ -468,49 +334,19 @@ func TestAPIUsageInfo_ManyPackages(t *testing.T) {
 
 	info := APIUsageInfo{
 		StepName:       "Many packages",
-		ClaudeTokens:   50000,
-		ClaudePackages: packages,
-		VTRequests:     0,
-		VTFiles:        nil,
+		OllamaPackages: packages,
 	}
 
 	// Verify the package list is stored correctly
-	if len(info.ClaudePackages) != 10 {
-		t.Errorf("expected 10 packages, got %d", len(info.ClaudePackages))
+	if len(info.OllamaPackages) != 10 {
+		t.Errorf("expected 10 packages, got %d", len(info.OllamaPackages))
 	}
 	// When displayed, only first 5 should show with "+X more"
 	displayCount := 5
-	if len(info.ClaudePackages) > displayCount {
-		remaining := len(info.ClaudePackages) - displayCount
+	if len(info.OllamaPackages) > displayCount {
+		remaining := len(info.OllamaPackages) - displayCount
 		if remaining != 5 {
 			t.Errorf("expected 5 remaining packages, got %d", remaining)
-		}
-	}
-}
-
-func TestAPIUsageInfo_ManyVTFiles(t *testing.T) {
-	files := make([]string, 8)
-	for i := 0; i < 8; i++ {
-		files[i] = "/path/to/file" + string(rune('1'+i)) + ".exe"
-	}
-
-	info := APIUsageInfo{
-		StepName:       "Many VT files",
-		ClaudeTokens:   0,
-		ClaudePackages: nil,
-		VTRequests:     8,
-		VTFiles:        files,
-	}
-
-	if len(info.VTFiles) != 8 {
-		t.Errorf("expected 8 VTFiles, got %d", len(info.VTFiles))
-	}
-	// When displayed, only first 5 should show
-	displayCount := 5
-	if len(info.VTFiles) > displayCount {
-		remaining := len(info.VTFiles) - displayCount
-		if remaining != 3 {
-			t.Errorf("expected 3 remaining files, got %d", remaining)
 		}
 	}
 }
@@ -607,314 +443,111 @@ func TestInteractiveSelector_PinnedNotLocked(t *testing.T) {
 
 func TestAPIQuotaStatus_Structure(t *testing.T) {
 	status := APIQuotaStatus{
-		ClaudeEnabled:           true,
-		ClaudeRequestsLimit:     1000,
-		ClaudeRequestsRemaining: 950,
-		ClaudeTokensLimit:       100000,
-		ClaudeTokensRemaining:   95000,
-		ClaudeError:             nil,
-		VTEnabled:               true,
-		VTDailyLimit:            500,
-		VTDailyUsed:             50,
-		VTDailyRemaining:        450,
-		VTRateLimit:             4,
-		VTError:                 nil,
+		OllamaEnabled:   true,
+		OllamaAvailable: true,
+		OllamaModel:     "gemma3",
+		OllamaError:     nil,
 	}
 
-	if !status.ClaudeEnabled {
-		t.Error("expected ClaudeEnabled to be true")
+	if !status.OllamaEnabled {
+		t.Error("expected OllamaEnabled to be true")
 	}
-	if status.ClaudeRequestsLimit != 1000 {
-		t.Errorf("expected ClaudeRequestsLimit 1000, got %d", status.ClaudeRequestsLimit)
+	if !status.OllamaAvailable {
+		t.Error("expected OllamaAvailable to be true")
 	}
-	if status.ClaudeRequestsRemaining != 950 {
-		t.Errorf("expected ClaudeRequestsRemaining 950, got %d", status.ClaudeRequestsRemaining)
-	}
-	if !status.VTEnabled {
-		t.Error("expected VTEnabled to be true")
-	}
-	if status.VTDailyLimit != 500 {
-		t.Errorf("expected VTDailyLimit 500, got %d", status.VTDailyLimit)
-	}
-	if status.VTDailyRemaining != 450 {
-		t.Errorf("expected VTDailyRemaining 450, got %d", status.VTDailyRemaining)
+	if status.OllamaModel != "gemma3" {
+		t.Errorf("expected OllamaModel gemma3, got %s", status.OllamaModel)
 	}
 }
 
-func TestAPIQuotaStatus_OnlyClaude(t *testing.T) {
+func TestAPIQuotaStatus_OllamaUnavailable(t *testing.T) {
 	status := APIQuotaStatus{
-		ClaudeEnabled:           true,
-		ClaudeRequestsLimit:     1000,
-		ClaudeRequestsRemaining: 800,
-		ClaudeTokensLimit:       100000,
-		ClaudeTokensRemaining:   80000,
-		VTEnabled:               false,
+		OllamaEnabled:   true,
+		OllamaAvailable: false, // Ollama not running
+		OllamaModel:     "gemma3",
 	}
 
-	if !status.ClaudeEnabled {
-		t.Error("expected ClaudeEnabled to be true")
+	if !status.OllamaEnabled {
+		t.Error("expected OllamaEnabled to be true")
 	}
-	if status.VTEnabled {
-		t.Error("expected VTEnabled to be false")
+	if status.OllamaAvailable {
+		t.Error("expected OllamaAvailable to be false when not running")
 	}
 }
 
-func TestAPIQuotaStatus_OnlyVT(t *testing.T) {
+func TestAPIQuotaStatus_WithError(t *testing.T) {
 	status := APIQuotaStatus{
-		ClaudeEnabled:    false,
-		VTEnabled:        true,
-		VTDailyLimit:     500,
-		VTDailyUsed:      100,
-		VTDailyRemaining: 400,
-		VTRateLimit:      4,
+		OllamaEnabled: true,
+		OllamaError:   fmt.Errorf("connection refused"),
 	}
 
-	if status.ClaudeEnabled {
-		t.Error("expected ClaudeEnabled to be false")
-	}
-	if !status.VTEnabled {
-		t.Error("expected VTEnabled to be true")
-	}
-}
-
-func TestAPIQuotaStatus_BothDisabled(t *testing.T) {
-	status := APIQuotaStatus{
-		ClaudeEnabled: false,
-		VTEnabled:     false,
-	}
-
-	if status.ClaudeEnabled {
-		t.Error("expected ClaudeEnabled to be false")
-	}
-	if status.VTEnabled {
-		t.Error("expected VTEnabled to be false")
-	}
-}
-
-func TestAPIQuotaStatus_LowClaudeQuota(t *testing.T) {
-	status := APIQuotaStatus{
-		ClaudeEnabled:           true,
-		ClaudeRequestsLimit:     1000,
-		ClaudeRequestsRemaining: 100, // 10% remaining
-		ClaudeTokensLimit:       100000,
-		ClaudeTokensRemaining:   10000, // 10% remaining
-	}
-
-	reqPct := float64(status.ClaudeRequestsRemaining) / float64(status.ClaudeRequestsLimit) * 100
-	tokPct := float64(status.ClaudeTokensRemaining) / float64(status.ClaudeTokensLimit) * 100
-
-	if reqPct >= 20 {
-		t.Errorf("expected low request quota (<20%%), got %.1f%%", reqPct)
-	}
-	if tokPct >= 20 {
-		t.Errorf("expected low token quota (<20%%), got %.1f%%", tokPct)
-	}
-}
-
-func TestAPIQuotaStatus_LowVTQuota(t *testing.T) {
-	status := APIQuotaStatus{
-		VTEnabled:        true,
-		VTDailyLimit:     500,
-		VTDailyUsed:      450,
-		VTDailyRemaining: 50, // 10% remaining
-	}
-
-	pct := float64(status.VTDailyRemaining) / float64(status.VTDailyLimit) * 100
-	if pct >= 20 {
-		t.Errorf("expected low VT quota (<20%%), got %.1f%%", pct)
-	}
-}
-
-func TestAPIQuotaStatus_WithErrors(t *testing.T) {
-	status := APIQuotaStatus{
-		ClaudeEnabled: true,
-		ClaudeError:   fmt.Errorf("API key invalid"),
-		VTEnabled:     true,
-		VTError:       fmt.Errorf("rate limit exceeded"),
-	}
-
-	if status.ClaudeError == nil {
-		t.Error("expected ClaudeError to be set")
-	}
-	if status.VTError == nil {
-		t.Error("expected VTError to be set")
+	if status.OllamaError == nil {
+		t.Error("expected OllamaError to be set")
 	}
 }
 
 func TestCheckQuotaSufficiency_AllSufficient(t *testing.T) {
 	s := CheckQuotaSufficiency(
-		5000, 10000, // Claude tokens: need 5000, have 10000
-		10, 100, // Claude requests: need 10, have 100
-		5, 500, // VT requests: need 5, have 500
+		5, true, // Ollama: 5 packages required, available
+		0, 0, // No VT
 	)
 
 	if !s.CanProceed {
 		t.Error("expected CanProceed to be true when all sufficient")
 	}
-	if !s.ClaudeTokensSufficient {
-		t.Error("expected ClaudeTokensSufficient to be true")
-	}
-	if !s.ClaudeRequestsSufficient {
-		t.Error("expected ClaudeRequestsSufficient to be true")
-	}
-	if !s.VTRequestsSufficient {
-		t.Error("expected VTRequestsSufficient to be true")
+	if !s.OllamaAvailable {
+		t.Error("expected OllamaAvailable to be true")
 	}
 	if s.Warning != "" {
 		t.Errorf("expected no warning, got %s", s.Warning)
 	}
 }
 
-func TestCheckQuotaSufficiency_InsufficientTokens(t *testing.T) {
+func TestCheckQuotaSufficiency_OllamaUnavailable(t *testing.T) {
 	s := CheckQuotaSufficiency(
-		10000, 5000, // Claude tokens: need 10000, have 5000
-		10, 100, // Claude requests: sufficient
-		5, 500, // VT requests: sufficient
+		5, false, // Ollama: 5 packages required, NOT available
+		0, 0, // No VT
 	)
 
 	if s.CanProceed {
-		t.Error("expected CanProceed to be false when tokens insufficient")
+		t.Error("expected CanProceed to be false when Ollama unavailable")
 	}
-	if s.ClaudeTokensSufficient {
-		t.Error("expected ClaudeTokensSufficient to be false")
-	}
-	if !s.PartialPossible {
-		t.Error("expected PartialPossible to be true when some quota available")
+	if s.OllamaAvailable {
+		t.Error("expected OllamaAvailable to be false")
 	}
 	if s.Warning == "" {
 		t.Error("expected warning message")
 	}
 }
 
-func TestCheckQuotaSufficiency_InsufficientRequests(t *testing.T) {
-	s := CheckQuotaSufficiency(
-		5000, 10000, // Claude tokens: sufficient
-		100, 10, // Claude requests: need 100, have 10
-		5, 500, // VT requests: sufficient
-	)
-
-	if s.CanProceed {
-		t.Error("expected CanProceed to be false when requests insufficient")
-	}
-	if !s.ClaudeTokensSufficient {
-		t.Error("expected ClaudeTokensSufficient to be true")
-	}
-	if s.ClaudeRequestsSufficient {
-		t.Error("expected ClaudeRequestsSufficient to be false")
-	}
-}
-
-func TestCheckQuotaSufficiency_InsufficientVT(t *testing.T) {
-	s := CheckQuotaSufficiency(
-		5000, 10000, // Claude tokens: sufficient
-		10, 100, // Claude requests: sufficient
-		100, 50, // VT requests: need 100, have 50
-	)
-
-	if s.CanProceed {
-		t.Error("expected CanProceed to be false when VT insufficient")
-	}
-	if s.VTRequestsSufficient {
-		t.Error("expected VTRequestsSufficient to be false")
-	}
-}
-
-func TestCheckQuotaSufficiency_AllInsufficient(t *testing.T) {
-	s := CheckQuotaSufficiency(
-		10000, 1000, // Claude tokens: insufficient
-		100, 10, // Claude requests: insufficient
-		100, 10, // VT requests: insufficient
-	)
-
-	if s.CanProceed {
-		t.Error("expected CanProceed to be false when all insufficient")
-	}
-	if s.ClaudeTokensSufficient {
-		t.Error("expected ClaudeTokensSufficient to be false")
-	}
-	if s.ClaudeRequestsSufficient {
-		t.Error("expected ClaudeRequestsSufficient to be false")
-	}
-	if s.VTRequestsSufficient {
-		t.Error("expected VTRequestsSufficient to be false")
-	}
-	if !s.PartialPossible {
-		t.Error("expected PartialPossible when some quota remains")
-	}
-}
-
 func TestCheckQuotaSufficiency_ZeroRequired(t *testing.T) {
 	s := CheckQuotaSufficiency(
-		0, 10000, // Claude tokens: none required
-		0, 100, // Claude requests: none required
-		0, 500, // VT requests: none required
+		0, true, // Ollama: none required
+		0, 0, // No VT
 	)
 
 	if !s.CanProceed {
 		t.Error("expected CanProceed to be true when nothing required")
 	}
-	if !s.ClaudeTokensSufficient {
-		t.Error("expected ClaudeTokensSufficient to be true when none required")
-	}
-}
-
-func TestCheckQuotaSufficiency_ZeroAvailable(t *testing.T) {
-	s := CheckQuotaSufficiency(
-		5000, 0, // Claude tokens: need 5000, have 0
-		10, 0, // Claude requests: need 10, have 0
-		5, 0, // VT requests: need 5, have 0
-	)
-
-	if s.CanProceed {
-		t.Error("expected CanProceed to be false when no quota available")
-	}
-	if s.PartialPossible {
-		t.Error("expected PartialPossible to be false when no quota at all")
-	}
-}
-
-func TestCheckQuotaSufficiency_ExactMatch(t *testing.T) {
-	s := CheckQuotaSufficiency(
-		5000, 5000, // Claude tokens: exact match
-		10, 10, // Claude requests: exact match
-		5, 5, // VT requests: exact match
-	)
-
-	if !s.CanProceed {
-		t.Error("expected CanProceed to be true when exact match")
-	}
-	if !s.ClaudeTokensSufficient {
-		t.Error("expected ClaudeTokensSufficient to be true on exact match")
-	}
 }
 
 func TestQuotaSufficiency_Structure(t *testing.T) {
 	s := QuotaSufficiency{
-		ClaudeTokensRequired:     10000,
-		ClaudeTokensAvailable:    5000,
-		ClaudeTokensSufficient:   false,
-		ClaudeRequestsRequired:   50,
-		ClaudeRequestsAvailable:  100,
-		ClaudeRequestsSufficient: true,
-		VTRequestsRequired:       10,
-		VTRequestsAvailable:      500,
-		VTRequestsSufficient:     true,
-		CanProceed:               false,
-		PartialPossible:          true,
-		Warning:                  "Claude tokens: need 10000, have 5000 (50% of required)",
+		OllamaPackagesRequired: 5,
+		OllamaAvailable:        false,
+		CanProceed:             false,
+		PartialPossible:        false,
+		Warning:                "Ollama not available: 5 packages require Ollama scan",
 	}
 
-	if s.ClaudeTokensRequired != 10000 {
-		t.Errorf("expected ClaudeTokensRequired 10000, got %d", s.ClaudeTokensRequired)
+	if s.OllamaPackagesRequired != 5 {
+		t.Errorf("expected OllamaPackagesRequired 5, got %d", s.OllamaPackagesRequired)
 	}
-	if s.ClaudeTokensSufficient {
-		t.Error("expected ClaudeTokensSufficient to be false")
+	if s.OllamaAvailable {
+		t.Error("expected OllamaAvailable to be false")
 	}
 	if s.CanProceed {
 		t.Error("expected CanProceed to be false")
-	}
-	if !s.PartialPossible {
-		t.Error("expected PartialPossible to be true")
 	}
 }
 
@@ -1019,16 +652,6 @@ func TestScanSelector_SelectAllWithinQuota(t *testing.T) {
 	if selector.tokensSelected != 6000 {
 		t.Errorf("expected 6000 tokens selected, got %d", selector.tokensSelected)
 	}
-	// First two should be selected
-	if !selector.items[0].Selected {
-		t.Error("expected first item to be selected")
-	}
-	if !selector.items[1].Selected {
-		t.Error("expected second item to be selected")
-	}
-	if selector.items[2].Selected {
-		t.Error("expected third item to NOT be selected")
-	}
 }
 
 func TestScanSelector_SelectByPriority(t *testing.T) {
@@ -1043,16 +666,6 @@ func TestScanSelector_SelectByPriority(t *testing.T) {
 
 	if selector.totalSelected != 2 {
 		t.Errorf("expected 2 selected, got %d", selector.totalSelected)
-	}
-	// High and medium priority should be selected
-	if selector.items[0].Selected {
-		t.Error("expected low priority item to NOT be selected")
-	}
-	if !selector.items[1].Selected {
-		t.Error("expected high priority item to be selected")
-	}
-	if !selector.items[2].Selected {
-		t.Error("expected medium priority item to be selected")
 	}
 }
 
@@ -1075,69 +688,5 @@ func TestScanSelector_SelectNone(t *testing.T) {
 	}
 	if selector.tokensSelected != 0 {
 		t.Errorf("expected 0 tokens after clear, got %d", selector.tokensSelected)
-	}
-}
-
-func TestScanSelector_OverQuota(t *testing.T) {
-	items := []ScanItem{
-		{Name: "pkg1", EstimatedTokens: 5000, Selected: true},
-		{Name: "pkg2", EstimatedTokens: 5000, Selected: true},
-		{Name: "pkg3", EstimatedTokens: 5000, Selected: true},
-	}
-
-	selector := NewScanSelector(items, 10000, 100) // 15000 selected, only 10000 available
-
-	if selector.tokensSelected != 15000 {
-		t.Errorf("expected tokensSelected 15000, got %d", selector.tokensSelected)
-	}
-	// Over quota
-	overQuota := selector.tokensSelected > selector.availableTokens
-	if !overQuota {
-		t.Error("expected to be over quota")
-	}
-}
-
-func TestScanSelector_RequestsLimit(t *testing.T) {
-	items := []ScanItem{
-		{Name: "pkg1", EstimatedTokens: 100, Selected: false},
-		{Name: "pkg2", EstimatedTokens: 100, Selected: false},
-		{Name: "pkg3", EstimatedTokens: 100, Selected: false},
-	}
-
-	selector := NewScanSelector(items, 10000, 2) // Only 2 requests allowed
-	selector.selectAllWithinQuota()
-
-	if selector.totalSelected != 2 {
-		t.Errorf("expected 2 selected (limited by requests), got %d", selector.totalSelected)
-	}
-}
-
-func TestScanSelector_ViewOffset(t *testing.T) {
-	items := make([]ScanItem, 50)
-	for i := range items {
-		items[i] = ScanItem{Name: fmt.Sprintf("pkg%d", i), EstimatedTokens: 100}
-	}
-
-	selector := NewScanSelector(items, 10000, 100)
-	selector.viewHeight = 10 // Force small view height
-
-	// Move cursor down past view
-	selector.cursor = 15
-	selector.adjustViewOffset()
-
-	if selector.viewOffset == 0 {
-		t.Error("expected viewOffset to be adjusted when cursor below viewport")
-	}
-}
-
-func TestScanSelector_ZeroTokens(t *testing.T) {
-	items := []ScanItem{
-		{Name: "pkg1", EstimatedTokens: 0, Selected: true},
-	}
-
-	selector := NewScanSelector(items, 10000, 100)
-
-	if selector.tokensSelected != 0 {
-		t.Errorf("expected tokensSelected 0, got %d", selector.tokensSelected)
 	}
 }

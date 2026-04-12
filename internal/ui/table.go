@@ -7,8 +7,7 @@ import (
 	"time"
 
 	"github.com/olekukonko/tablewriter"
-	"github.com/sud0x0/bsau/internal/claude"
-	"github.com/sud0x0/bsau/internal/hashlookup"
+	"github.com/sud0x0/bsau/internal/ollama"
 )
 
 // Color codes for terminal output
@@ -49,17 +48,18 @@ type PackageRow struct {
 type PreInstallRow struct {
 	Package        string
 	CVECount       int
-	ClaudeVerdict  claude.Verdict
+	OllamaVerdict  ollama.Verdict
 	Recommendation string
 }
 
-// PostInstallRow represents a row in the post-install summary (Step 6)
+// PostInstallRow represents a row in the post-install summary (Step 6) and inspect results
 type PostInstallRow struct {
 	Package       string
-	CIRCLResult   hashlookup.HashResult
-	VTResult      string
+	Version       string
+	CVECount      int
+	Severity      Severity
 	SemgrepCount  int
-	ClaudeVerdict claude.Verdict
+	OllamaVerdict ollama.Verdict
 	Overall       string
 }
 
@@ -106,7 +106,7 @@ func RenderPackageTable(rows []PackageRow) {
 }
 
 // RenderPreInstallTable displays pre-install scan results (Step 4)
-func RenderPreInstallTable(rows []PreInstallRow, showClaude bool) {
+func RenderPreInstallTable(rows []PreInstallRow, showOllama bool) {
 	headers := []string{"Package", "CVEs", "Recommendation"}
 	alignments := []int{
 		tablewriter.ALIGN_LEFT,
@@ -114,8 +114,8 @@ func RenderPreInstallTable(rows []PreInstallRow, showClaude bool) {
 		tablewriter.ALIGN_LEFT,
 	}
 
-	if showClaude {
-		headers = []string{"Package", "CVEs", "Claude Verdict", "Recommendation"}
+	if showOllama {
+		headers = []string{"Package", "CVEs", "Ollama Verdict", "Recommendation"}
 		alignments = []int{
 			tablewriter.ALIGN_LEFT,
 			tablewriter.ALIGN_RIGHT,
@@ -137,8 +137,8 @@ func RenderPreInstallTable(rows []PreInstallRow, showClaude bool) {
 			fmt.Sprintf("%d", row.CVECount),
 		}
 
-		if showClaude {
-			cols = append(cols, colorVerdict(row.ClaudeVerdict))
+		if showOllama {
+			cols = append(cols, colorVerdict(row.OllamaVerdict))
 		}
 
 		cols = append(cols, colorRecommendation(row.Recommendation))
@@ -148,24 +148,44 @@ func RenderPreInstallTable(rows []PreInstallRow, showClaude bool) {
 	table.Render()
 }
 
+// InspectTableOptions controls which columns to show in inspect results
+type InspectTableOptions struct {
+	ShowVuln    bool
+	ShowSemgrep bool
+	ShowOllama  bool
+}
+
 // RenderPostInstallTable displays post-install summary (Step 6)
-func RenderPostInstallTable(rows []PostInstallRow, showVT, showClaude bool) {
-	headers := []string{"Package", "CIRCL", "Semgrep", "Overall"}
-	alignments := []int{
-		tablewriter.ALIGN_LEFT,
-		tablewriter.ALIGN_CENTER,
-		tablewriter.ALIGN_RIGHT,
-		tablewriter.ALIGN_CENTER,
+func RenderPostInstallTable(rows []PostInstallRow, showOllama bool) {
+	RenderInspectTable(rows, InspectTableOptions{
+		ShowVuln:    false,
+		ShowSemgrep: true,
+		ShowOllama:  showOllama,
+	})
+}
+
+// RenderInspectTable displays inspect results with configurable columns
+func RenderInspectTable(rows []PostInstallRow, opts InspectTableOptions) {
+	headers := []string{"Package"}
+	alignments := []int{tablewriter.ALIGN_LEFT}
+
+	if opts.ShowVuln {
+		headers = append(headers, "Version", "CVEs", "Severity")
+		alignments = append(alignments, tablewriter.ALIGN_LEFT, tablewriter.ALIGN_RIGHT, tablewriter.ALIGN_CENTER)
 	}
 
-	if showVT {
-		headers = insertAt(headers, 2, "VT")
-		alignments = insertIntAt(alignments, 2, tablewriter.ALIGN_CENTER)
+	if opts.ShowSemgrep {
+		headers = append(headers, "Semgrep")
+		alignments = append(alignments, tablewriter.ALIGN_RIGHT)
 	}
-	if showClaude {
-		headers = insertAt(headers, len(headers)-1, "Claude")
-		alignments = insertIntAt(alignments, len(alignments)-1, tablewriter.ALIGN_CENTER)
+
+	if opts.ShowOllama {
+		headers = append(headers, "Ollama")
+		alignments = append(alignments, tablewriter.ALIGN_CENTER)
 	}
+
+	headers = append(headers, "Overall")
+	alignments = append(alignments, tablewriter.ALIGN_CENTER)
 
 	table := tablewriter.NewWriter(os.Stdout)
 	table.SetHeader(headers)
@@ -175,17 +195,22 @@ func RenderPostInstallTable(rows []PostInstallRow, showVT, showClaude bool) {
 	table.SetColumnAlignment(alignments)
 
 	for _, row := range rows {
-		cols := []string{
-			row.Package,
-			colorHashResult(row.CIRCLResult),
-			fmt.Sprintf("%d", row.SemgrepCount),
+		cols := []string{row.Package}
+
+		if opts.ShowVuln {
+			cves := fmt.Sprintf("%d", row.CVECount)
+			if row.Severity == SeverityNA {
+				cves = "N/A"
+			}
+			cols = append(cols, row.Version, cves, colorSeverity(row.Severity))
 		}
 
-		if showVT {
-			cols = insertAt(cols, 2, row.VTResult)
+		if opts.ShowSemgrep {
+			cols = append(cols, fmt.Sprintf("%d", row.SemgrepCount))
 		}
-		if showClaude {
-			cols = insertAt(cols, len(cols)-1, colorVerdict(row.ClaudeVerdict))
+
+		if opts.ShowOllama {
+			cols = append(cols, colorVerdict(row.OllamaVerdict))
 		}
 
 		cols = append(cols, colorOverall(row.Overall))
@@ -358,35 +383,16 @@ func colorSeverity(s Severity) string {
 	}
 }
 
-func colorVerdict(v claude.Verdict) string {
+func colorVerdict(v ollama.Verdict) string {
 	switch v {
-	case claude.VerdictSafe:
+	case ollama.VerdictSafe:
 		return ColorGreen + string(v) + ColorReset
-	case claude.VerdictReview:
+	case ollama.VerdictReview:
 		return ColorYellow + string(v) + ColorReset
-	case claude.VerdictHold:
+	case ollama.VerdictHold:
 		return ColorRed + string(v) + ColorReset
 	default:
 		return string(v)
-	}
-}
-
-func colorHashResult(h hashlookup.HashResult) string {
-	switch h {
-	case hashlookup.HashNotFlaggedByCIRCL:
-		return ColorGreen + "CLEAN" + ColorReset
-	case hashlookup.HashNotInCIRCL:
-		return "NOT_IN_DB"
-	case hashlookup.HashCIRCLMalicious:
-		return ColorRed + "MALICIOUS" + ColorReset
-	case hashlookup.HashVTConfirmed:
-		return ColorRed + "VT_CONFIRMED" + ColorReset
-	case hashlookup.HashVTClean:
-		return ColorYellow + "VT_CLEAN" + ColorReset
-	case hashlookup.HashVTNotFound:
-		return ColorYellow + "VT_NOT_FOUND" + ColorReset
-	default:
-		return string(h)
 	}
 }
 
@@ -418,28 +424,10 @@ func colorOverall(o string) string {
 	}
 }
 
-func insertAt(slice []string, index int, value string) []string {
-	if index >= len(slice) {
-		return append(slice, value)
-	}
-	slice = append(slice[:index+1], slice[index:]...)
-	slice[index] = value
-	return slice
-}
-
-func insertIntAt(slice []int, index int, value int) []int {
-	if index >= len(slice) {
-		return append(slice, value)
-	}
-	slice = append(slice[:index+1], slice[index:]...)
-	slice[index] = value
-	return slice
-}
-
 // ScanFailure represents a failure during the workflow
 type ScanFailure struct {
 	Package string // Package name (empty for non-package-specific failures)
-	Step    string // Which step failed (e.g., "OSV Scan", "CIRCL Hash", "Semgrep")
+	Step    string // Which step failed (e.g., "OSV Scan", "Semgrep")
 	Error   string // Error message
 }
 

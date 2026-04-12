@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/sud0x0/bsau/internal/config"
+	"github.com/sud0x0/bsau/internal/ui"
 )
 
 var (
@@ -24,22 +25,31 @@ var rootCmd = &cobra.Command{
 	Long: `bsau is a security-focused Homebrew package manager wrapper.
 
 It scans, audits, and safely updates Homebrew packages on macOS by combining:
-  - Vulnerability lookup via OSV.dev
-  - Binary hash verification via CIRCL hashlookup (+ VirusTotal confirmation)
+  - Vulnerability lookup via OSV.dev and NIST NVD
   - Static analysis via Semgrep
-  - LLM-based code analysis via Claude
+  - LLM-based code analysis via Ollama (local)
 
 All scanning is read-only. No packages are modified without explicit user approval.
 
 Commands:
   bsau run         Full scan and update workflow
   bsau inspect     Scan current installation without upgrading
-  bsau version     Print version information
-  bsau help        Show help`,
+  bsau init        Generate default config file
+  bsau version     Print version information`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		// Skip config loading for version and help commands
-		if cmd.Name() == "version" || cmd.Name() == "help" {
+		// Skip config loading for version, help, and init commands
+		if cmd.Name() == "version" || cmd.Name() == "help" || cmd.Name() == "init" {
 			return nil
+		}
+
+		// Auto-generate config on first run if it doesn't exist
+		if !config.ConfigExists() {
+			configPath, err := config.GenerateConfigFile()
+			if err != nil {
+				return fmt.Errorf("generating config: %w", err)
+			}
+			ui.PrintInfo(fmt.Sprintf("Generated default config: %s", configPath))
+			ui.PrintInfo("Edit this file to customize settings (e.g., enable Ollama)")
 		}
 
 		// Load configuration

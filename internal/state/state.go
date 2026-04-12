@@ -117,6 +117,20 @@ func (m *RunManager) CleanupPackageSnapshot(pkg string) error {
 	return os.RemoveAll(pkgDir)
 }
 
+// VulnReportPath returns the path to the vulnerability report file
+func (m *RunManager) VulnReportPath() string {
+	return filepath.Join(m.runDir, "vulnerability-report.txt")
+}
+
+// SaveVulnReport saves a text file with detailed vulnerability information
+func (m *RunManager) SaveVulnReport(content string) error {
+	path := m.VulnReportPath()
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		return fmt.Errorf("writing vulnerability report: %w", err)
+	}
+	return nil
+}
+
 // VTDailyManager handles persistent VT daily tracking
 type VTDailyManager struct {
 	path string

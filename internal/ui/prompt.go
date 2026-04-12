@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sud0x0/bsau/internal/claude"
+	"github.com/sud0x0/bsau/internal/ollama"
 	"golang.org/x/term"
 )
 
@@ -189,7 +189,7 @@ func (p *Prompter) excludePackages(packages []string) ([]string, error) {
 }
 
 // ConfirmPackageUpgrade asks for confirmation before upgrading a specific package
-func (p *Prompter) ConfirmPackageUpgrade(pkg string, verdict claude.Verdict, reason string) (bool, error) {
+func (p *Prompter) ConfirmPackageUpgrade(pkg string, verdict ollama.Verdict, reason string) (bool, error) {
 	fmt.Println()
 	fmt.Printf("Package: %s%s%s\n", ColorBold, pkg, ColorReset)
 	fmt.Printf("Verdict: %s\n", colorVerdict(verdict))
@@ -197,7 +197,7 @@ func (p *Prompter) ConfirmPackageUpgrade(pkg string, verdict claude.Verdict, rea
 		fmt.Printf("Reason:  %s\n", reason)
 	}
 
-	return p.Confirm("Proceed with upgrade?", verdict == claude.VerdictSafe)
+	return p.Confirm("Proceed with upgrade?", verdict == ollama.VerdictSafe)
 }
 
 // WaitForEnter waits for the user to press Enter
@@ -255,9 +255,8 @@ func (p *Prompter) ReadInput(prompt string) (string, error) {
 
 // APIUsageInfo contains information about API usage for user confirmation
 type APIUsageInfo struct {
-	StepName       string   // Name of the step (e.g., "Pre-install Claude scan")
-	ClaudeTokens   int      // Total Claude tokens required
-	ClaudePackages []string // Packages that will use Claude
+	StepName       string   // Name of the step (e.g., "Pre-install Ollama scan")
+	OllamaPackages []string // Packages that will use Ollama
 	VTRequests     int      // Total VT API requests required
 	VTFiles        []string // Files that will be checked via VT
 }
@@ -271,24 +270,23 @@ func (p *Prompter) ConfirmAPIUsage(info APIUsageInfo) (bool, error) {
 	fmt.Printf("%s└─────────────────────────────────────────────────────────────┘%s\n", ColorCyan, ColorReset)
 	fmt.Println()
 
-	hasClaudeUsage := info.ClaudeTokens > 0
+	hasOllamaUsage := len(info.OllamaPackages) > 0
 	hasVTUsage := info.VTRequests > 0
 
-	if !hasClaudeUsage && !hasVTUsage {
+	if !hasOllamaUsage && !hasVTUsage {
 		fmt.Println("  No API calls required for this step.")
 		return true, nil
 	}
 
-	if hasClaudeUsage {
-		fmt.Printf("  %sClaude API:%s\n", ColorBold, ColorReset)
-		fmt.Printf("    Tokens required: %s%d%s\n", ColorYellow, info.ClaudeTokens, ColorReset)
-		fmt.Printf("    Packages (%d):   ", len(info.ClaudePackages))
-		if len(info.ClaudePackages) <= 5 {
-			fmt.Printf("%s\n", strings.Join(info.ClaudePackages, ", "))
+	if hasOllamaUsage {
+		fmt.Printf("  %sOllama (local):%s\n", ColorBold, ColorReset)
+		fmt.Printf("    Packages (%d):   ", len(info.OllamaPackages))
+		if len(info.OllamaPackages) <= 5 {
+			fmt.Printf("%s\n", strings.Join(info.OllamaPackages, ", "))
 		} else {
 			fmt.Printf("%s, ... (+%d more)\n",
-				strings.Join(info.ClaudePackages[:5], ", "),
-				len(info.ClaudePackages)-5)
+				strings.Join(info.OllamaPackages[:5], ", "),
+				len(info.OllamaPackages)-5)
 		}
 		fmt.Println()
 	}
@@ -325,13 +323,9 @@ func (p *Prompter) ConfirmAPIUsage(info APIUsageInfo) (bool, error) {
 
 // QuotaSufficiency represents whether there's enough API quota for an operation
 type QuotaSufficiency struct {
-	// Claude
-	ClaudeTokensRequired     int
-	ClaudeTokensAvailable    int
-	ClaudeTokensSufficient   bool
-	ClaudeRequestsRequired   int
-	ClaudeRequestsAvailable  int
-	ClaudeRequestsSufficient bool
+	// Ollama (local - no quota limits, always available if running)
+	OllamaPackagesRequired int
+	OllamaAvailable        bool
 
 	// VirusTotal
 	VTRequestsRequired   int
@@ -346,35 +340,25 @@ type QuotaSufficiency struct {
 
 // CheckQuotaSufficiency compares required usage against available quota
 func CheckQuotaSufficiency(
-	claudeTokensRequired, claudeTokensAvailable int,
-	claudeRequestsRequired, claudeRequestsAvailable int,
+	ollamaPackagesRequired int, ollamaAvailable bool,
 	vtRequestsRequired, vtRequestsAvailable int,
 ) *QuotaSufficiency {
 	s := &QuotaSufficiency{
-		ClaudeTokensRequired:    claudeTokensRequired,
-		ClaudeTokensAvailable:   claudeTokensAvailable,
-		ClaudeRequestsRequired:  claudeRequestsRequired,
-		ClaudeRequestsAvailable: claudeRequestsAvailable,
-		VTRequestsRequired:      vtRequestsRequired,
-		VTRequestsAvailable:     vtRequestsAvailable,
+		OllamaPackagesRequired: ollamaPackagesRequired,
+		OllamaAvailable:        ollamaAvailable,
+		VTRequestsRequired:     vtRequestsRequired,
+		VTRequestsAvailable:    vtRequestsAvailable,
 	}
-
-	// Check Claude tokens
-	s.ClaudeTokensSufficient = claudeTokensRequired <= claudeTokensAvailable || claudeTokensRequired == 0
-
-	// Check Claude requests
-	s.ClaudeRequestsSufficient = claudeRequestsRequired <= claudeRequestsAvailable || claudeRequestsRequired == 0
 
 	// Check VT requests
 	s.VTRequestsSufficient = vtRequestsRequired <= vtRequestsAvailable || vtRequestsRequired == 0
 
-	// Overall assessment
-	s.CanProceed = s.ClaudeTokensSufficient && s.ClaudeRequestsSufficient && s.VTRequestsSufficient
+	// Overall assessment - Ollama is local so always available if running
+	s.CanProceed = (ollamaPackagesRequired == 0 || ollamaAvailable) && s.VTRequestsSufficient
 
 	// Check if partial work is possible
 	if !s.CanProceed {
-		// Can do partial if we have at least some quota
-		s.PartialPossible = claudeTokensAvailable > 0 || claudeRequestsAvailable > 0 || vtRequestsAvailable > 0
+		s.PartialPossible = vtRequestsAvailable > 0
 	}
 
 	// Build warning message
@@ -386,17 +370,10 @@ func CheckQuotaSufficiency(
 func (s *QuotaSufficiency) buildWarning() {
 	var warnings []string
 
-	if !s.ClaudeTokensSufficient {
+	if s.OllamaPackagesRequired > 0 && !s.OllamaAvailable {
 		warnings = append(warnings, fmt.Sprintf(
-			"Claude tokens: need %d, have %d (%.0f%% of required)",
-			s.ClaudeTokensRequired, s.ClaudeTokensAvailable,
-			float64(s.ClaudeTokensAvailable)/float64(s.ClaudeTokensRequired)*100))
-	}
-
-	if !s.ClaudeRequestsSufficient {
-		warnings = append(warnings, fmt.Sprintf(
-			"Claude requests: need %d, have %d",
-			s.ClaudeRequestsRequired, s.ClaudeRequestsAvailable))
+			"Ollama not available: %d packages require Ollama scan",
+			s.OllamaPackagesRequired))
 	}
 
 	if !s.VTRequestsSufficient {
@@ -412,13 +389,11 @@ func (s *QuotaSufficiency) buildWarning() {
 
 // APIQuotaStatus contains quota information for all APIs
 type APIQuotaStatus struct {
-	// Claude API
-	ClaudeEnabled           bool
-	ClaudeRequestsLimit     int
-	ClaudeRequestsRemaining int
-	ClaudeTokensLimit       int
-	ClaudeTokensRemaining   int
-	ClaudeError             error
+	// Ollama (local)
+	OllamaEnabled   bool
+	OllamaAvailable bool
+	OllamaModel     string
+	OllamaError     error
 
 	// VirusTotal API
 	VTEnabled        bool
@@ -433,46 +408,24 @@ type APIQuotaStatus struct {
 func DisplayAPIQuota(status APIQuotaStatus) {
 	fmt.Println()
 	fmt.Printf("%s┌─────────────────────────────────────────────────────────────┐%s\n", ColorCyan, ColorReset)
-	fmt.Printf("%s│ API Quota Status                                            │%s\n", ColorCyan, ColorReset)
+	fmt.Printf("%s│ API Status                                                  │%s\n", ColorCyan, ColorReset)
 	fmt.Printf("%s└─────────────────────────────────────────────────────────────┘%s\n", ColorCyan, ColorReset)
 	fmt.Println()
 
-	// Claude API status
-	if status.ClaudeEnabled {
-		fmt.Printf("  %sClaude API:%s\n", ColorBold, ColorReset)
-		if status.ClaudeError != nil {
-			fmt.Printf("    %sError: %s%s\n", ColorRed, status.ClaudeError, ColorReset)
+	// Ollama status
+	if status.OllamaEnabled {
+		fmt.Printf("  %sOllama (local):%s\n", ColorBold, ColorReset)
+		if status.OllamaError != nil {
+			fmt.Printf("    %sError: %s%s\n", ColorRed, status.OllamaError, ColorReset)
+		} else if status.OllamaAvailable {
+			fmt.Printf("    Status:  %sAvailable%s\n", ColorGreen, ColorReset)
+			fmt.Printf("    Model:   %s\n", status.OllamaModel)
 		} else {
-			// Requests
-			reqPct := 0.0
-			if status.ClaudeRequestsLimit > 0 {
-				reqPct = float64(status.ClaudeRequestsRemaining) / float64(status.ClaudeRequestsLimit) * 100
-			}
-			reqColor := ColorGreen
-			if reqPct < 20 {
-				reqColor = ColorRed
-			} else if reqPct < 50 {
-				reqColor = ColorYellow
-			}
-			fmt.Printf("    Requests:  %s%d%s / %d remaining (%.0f%%)\n",
-				reqColor, status.ClaudeRequestsRemaining, ColorReset, status.ClaudeRequestsLimit, reqPct)
-
-			// Tokens
-			if status.ClaudeTokensLimit > 0 {
-				tokPct := float64(status.ClaudeTokensRemaining) / float64(status.ClaudeTokensLimit) * 100
-				tokColor := ColorGreen
-				if tokPct < 20 {
-					tokColor = ColorRed
-				} else if tokPct < 50 {
-					tokColor = ColorYellow
-				}
-				fmt.Printf("    Tokens:    %s%d%s / %d remaining (%.0f%%)\n",
-					tokColor, status.ClaudeTokensRemaining, ColorReset, status.ClaudeTokensLimit, tokPct)
-			}
+			fmt.Printf("    Status:  %sNot running%s (start with: ollama serve)\n", ColorRed, ColorReset)
 		}
 		fmt.Println()
 	} else {
-		fmt.Printf("  %sClaude API:%s %sDisabled%s (set features.claude_scan: true)\n",
+		fmt.Printf("  %sOllama:%s %sDisabled%s (set features.ollama_scan: true)\n",
 			ColorBold, ColorReset, ColorYellow, ColorReset)
 		fmt.Println()
 	}
@@ -519,26 +472,16 @@ const (
 func (p *Prompter) ConfirmInsufficientQuota(sufficiency *QuotaSufficiency) (InsufficientQuotaChoice, error) {
 	fmt.Println()
 	fmt.Printf("%s┌─────────────────────────────────────────────────────────────┐%s\n", ColorRed, ColorReset)
-	fmt.Printf("%s│ ⚠ INSUFFICIENT API QUOTA                                    │%s\n", ColorRed, ColorReset)
+	fmt.Printf("%s│ ⚠ SERVICE UNAVAILABLE                                       │%s\n", ColorRed, ColorReset)
 	fmt.Printf("%s└─────────────────────────────────────────────────────────────┘%s\n", ColorRed, ColorReset)
 	fmt.Println()
 
-	// Show what's insufficient
-	if !sufficiency.ClaudeTokensSufficient {
-		fmt.Printf("  %sClaude Tokens:%s\n", ColorBold, ColorReset)
-		fmt.Printf("    Required:  %s%d%s\n", ColorYellow, sufficiency.ClaudeTokensRequired, ColorReset)
-		fmt.Printf("    Available: %s%d%s\n", ColorRed, sufficiency.ClaudeTokensAvailable, ColorReset)
-		if sufficiency.ClaudeTokensAvailable > 0 {
-			coveragePct := float64(sufficiency.ClaudeTokensAvailable) / float64(sufficiency.ClaudeTokensRequired) * 100
-			fmt.Printf("    Coverage:  %.0f%% of packages can be scanned\n", coveragePct)
-		}
-		fmt.Println()
-	}
-
-	if !sufficiency.ClaudeRequestsSufficient {
-		fmt.Printf("  %sClaude Requests:%s\n", ColorBold, ColorReset)
-		fmt.Printf("    Required:  %s%d%s\n", ColorYellow, sufficiency.ClaudeRequestsRequired, ColorReset)
-		fmt.Printf("    Available: %s%d%s\n", ColorRed, sufficiency.ClaudeRequestsAvailable, ColorReset)
+	// Show what's unavailable
+	if sufficiency.OllamaPackagesRequired > 0 && !sufficiency.OllamaAvailable {
+		fmt.Printf("  %sOllama (local):%s\n", ColorBold, ColorReset)
+		fmt.Printf("    Status:    %sNot running%s\n", ColorRed, ColorReset)
+		fmt.Printf("    Required:  %s%d%s packages need scanning\n", ColorYellow, sufficiency.OllamaPackagesRequired, ColorReset)
+		fmt.Printf("    Start with: ollama serve\n")
 		fmt.Println()
 	}
 
@@ -552,11 +495,11 @@ func (p *Prompter) ConfirmInsufficientQuota(sufficiency *QuotaSufficiency) (Insu
 	// Show options
 	fmt.Println("  Options:")
 	if sufficiency.PartialPossible {
-		fmt.Printf("    %s[1]%s Proceed with partial scan (use available quota)\n", ColorYellow, ColorReset)
-		fmt.Printf("        - Scan as many packages as quota allows\n")
+		fmt.Printf("    %s[1]%s Proceed with partial scan (use available services)\n", ColorYellow, ColorReset)
+		fmt.Printf("        - Scan as many packages as possible\n")
 		fmt.Printf("        - Remaining packages marked as REVIEW\n")
 	}
-	fmt.Printf("    %s[2]%s Skip API scans entirely (mark all as REVIEW)\n", ColorYellow, ColorReset)
+	fmt.Printf("    %s[2]%s Skip scans entirely (mark all as REVIEW)\n", ColorYellow, ColorReset)
 	fmt.Printf("    %s[3]%s Cancel operation\n", ColorRed, ColorReset)
 	fmt.Println()
 
@@ -571,7 +514,7 @@ func (p *Prompter) ConfirmInsufficientQuota(sufficiency *QuotaSufficiency) (Insu
 			if sufficiency.PartialPossible {
 				return QuotaChoiceProceedPartial, nil
 			}
-			fmt.Printf("  %sPartial scan not available - no quota remaining%s\n", ColorRed, ColorReset)
+			fmt.Printf("  %sPartial scan not available - no services available%s\n", ColorRed, ColorReset)
 		case "2":
 			return QuotaChoiceSkipAPI, nil
 		case "3", "":
@@ -582,7 +525,7 @@ func (p *Prompter) ConfirmInsufficientQuota(sufficiency *QuotaSufficiency) (Insu
 	}
 }
 
-// DisplayQuotaComparison shows required vs available quota before an operation
+// DisplayQuotaComparison shows required vs available services before an operation
 func DisplayQuotaComparison(sufficiency *QuotaSufficiency, stepName string) {
 	fmt.Println()
 
@@ -594,37 +537,28 @@ func DisplayQuotaComparison(sufficiency *QuotaSufficiency, stepName string) {
 	}
 
 	fmt.Printf("%s┌─────────────────────────────────────────────────────────────┐%s\n", ColorCyan, ColorReset)
-	fmt.Printf("%s│ Quota Check: %-47s│%s\n", ColorCyan, stepName, ColorReset)
+	fmt.Printf("%s│ Service Check: %-45s│%s\n", ColorCyan, stepName, ColorReset)
 	fmt.Printf("%s└─────────────────────────────────────────────────────────────┘%s\n", ColorCyan, ColorReset)
 	fmt.Println()
 
-	// Claude section
-	if sufficiency.ClaudeTokensRequired > 0 || sufficiency.ClaudeRequestsRequired > 0 {
-		fmt.Printf("  %sClaude API:%s\n", ColorBold, ColorReset)
-
-		if sufficiency.ClaudeTokensRequired > 0 {
-			tokColor := ColorGreen
-			tokIcon := "✓"
-			if !sufficiency.ClaudeTokensSufficient {
-				tokColor = ColorRed
-				tokIcon = "✗"
-			}
-			fmt.Printf("    %s%s%s Tokens:   %d required / %d available\n",
-				tokColor, tokIcon, ColorReset,
-				sufficiency.ClaudeTokensRequired, sufficiency.ClaudeTokensAvailable)
+	// Ollama section
+	if sufficiency.OllamaPackagesRequired > 0 {
+		fmt.Printf("  %sOllama (local):%s\n", ColorBold, ColorReset)
+		ollamaColor := ColorGreen
+		ollamaIcon := "✓"
+		if !sufficiency.OllamaAvailable {
+			ollamaColor = ColorRed
+			ollamaIcon = "✗"
 		}
-
-		if sufficiency.ClaudeRequestsRequired > 0 {
-			reqColor := ColorGreen
-			reqIcon := "✓"
-			if !sufficiency.ClaudeRequestsSufficient {
-				reqColor = ColorRed
-				reqIcon = "✗"
-			}
-			fmt.Printf("    %s%s%s Requests: %d required / %d available\n",
-				reqColor, reqIcon, ColorReset,
-				sufficiency.ClaudeRequestsRequired, sufficiency.ClaudeRequestsAvailable)
-		}
+		fmt.Printf("    %s%s%s Status:   %s\n",
+			ollamaColor, ollamaIcon, ColorReset,
+			func() string {
+				if sufficiency.OllamaAvailable {
+					return "Available"
+				}
+				return "Not running"
+			}())
+		fmt.Printf("    Packages: %d to scan\n", sufficiency.OllamaPackagesRequired)
 		fmt.Println()
 	}
 
@@ -647,18 +581,18 @@ func DisplayQuotaComparison(sufficiency *QuotaSufficiency, stepName string) {
 	fmt.Printf("  %sStatus: %s%s %s%s\n", ColorBold, statusColor, statusIcon,
 		func() string {
 			if sufficiency.CanProceed {
-				return "Sufficient quota available"
+				return "All services available"
 			}
-			return "Insufficient quota"
+			return "Some services unavailable"
 		}(), ColorReset)
 	fmt.Println()
 }
 
-// ScanItem represents an item that can be scanned with token cost
+// ScanItem represents an item that can be scanned
 type ScanItem struct {
 	Name            string // Package or file name
 	Description     string // Additional info (version, path, etc.)
-	EstimatedTokens int    // Estimated Claude tokens for this item
+	EstimatedTokens int    // Estimated tokens for this item (for display purposes)
 	Selected        bool
 	Priority        int    // Higher = more important (for sorting)
 	Category        string // Optional grouping (e.g., "formula", "code", "file")

@@ -1,5 +1,5 @@
 # test-malicious-dummy.rb
-# This is a dummy malicious formula for testing bsau's Claude scanner.
+# This is a dummy malicious formula for testing bsau's Ollama scanner.
 # It contains multiple malicious indicators that should trigger a HOLD verdict:
 # - Hardcoded IP address
 # - Base64 decode pipe to shell

@@ -17,37 +17,26 @@ const (
 type Config struct {
 	HomebrewPath string `mapstructure:"homebrew_path"`
 
-	HashCheck   HashCheckConfig   `mapstructure:"hash_check"`
 	Features    FeaturesConfig    `mapstructure:"features"`
 	BlockPolicy BlockPolicyConfig `mapstructure:"block_policy"`
 
-	ClaudeModel        string `mapstructure:"claude_model"`
-	ClaudeMaxFileBytes int    `mapstructure:"claude_max_file_bytes"`
-
-	VTRateLimitPerMinute int `mapstructure:"vt_rate_limit_per_minute"`
-	VTDailyLimit         int `mapstructure:"vt_daily_limit"`
+	OllamaURL          string `mapstructure:"ollama_url"`
+	OllamaModel        string `mapstructure:"ollama_model"`
+	OllamaMaxFileBytes int    `mapstructure:"ollama_max_file_bytes"`
 
 	// Runtime overrides (set via CLI flags)
-	NoClaude bool `mapstructure:"-"`
-	NoVT     bool `mapstructure:"-"`
+	NoOllama bool `mapstructure:"-"`
 	DryRun   bool `mapstructure:"-"`
 	Verbose  bool `mapstructure:"-"`
 }
 
-type HashCheckConfig struct {
-	CIRCLURL string `mapstructure:"circl_url"`
-}
-
 type FeaturesConfig struct {
-	ClaudeScan bool `mapstructure:"claude_scan"`
-	VTFallback bool `mapstructure:"vt_fallback"`
+	OllamaScan bool `mapstructure:"ollama_scan"`
 }
 
 type BlockPolicyConfig struct {
-	ClaudeFormulaHold bool `mapstructure:"claude_formula_hold"`
-	VTConfirmed       bool `mapstructure:"vt_confirmed"`
-	ClaudeCodeHold    bool `mapstructure:"claude_code_hold"`
-	RequireBoth       bool `mapstructure:"require_both"`
+	OllamaFormulaHold bool `mapstructure:"ollama_formula_hold"`
+	OllamaCodeHold    bool `mapstructure:"ollama_code_hold"`
 }
 
 // GetBinaryDir returns the directory where the bsau binary is located
@@ -79,17 +68,12 @@ func Load() (*Config, error) {
 
 	// Set defaults
 	v.SetDefault("homebrew_path", "/opt/homebrew")
-	v.SetDefault("hash_check.circl_url", "https://hashlookup.circl.lu")
-	v.SetDefault("features.claude_scan", false)
-	v.SetDefault("features.vt_fallback", false)
-	v.SetDefault("block_policy.claude_formula_hold", true)
-	v.SetDefault("block_policy.vt_confirmed", true)
-	v.SetDefault("block_policy.claude_code_hold", true)
-	v.SetDefault("block_policy.require_both", false)
-	v.SetDefault("claude_model", "claude-sonnet-4-6")
-	v.SetDefault("claude_max_file_bytes", 12000)
-	v.SetDefault("vt_rate_limit_per_minute", 4)
-	v.SetDefault("vt_daily_limit", 500)
+	v.SetDefault("features.ollama_scan", false)
+	v.SetDefault("block_policy.ollama_formula_hold", true)
+	v.SetDefault("block_policy.ollama_code_hold", true)
+	v.SetDefault("ollama_url", "http://localhost:11434")
+	v.SetDefault("ollama_model", "gemma3")
+	v.SetDefault("ollama_max_file_bytes", 12000)
 
 	// Check for config override via env
 	configPath := os.Getenv("BSAU_CONFIG")
@@ -124,33 +108,16 @@ func Load() (*Config, error) {
 	return &cfg, nil
 }
 
-// Validate checks that required environment variables are set for enabled features
+// Validate checks configuration validity
 func (c *Config) Validate() error {
-	if c.Features.ClaudeScan && !c.NoClaude {
-		if os.Getenv("ANTHROPIC_API_KEY") == "" {
-			return fmt.Errorf("features.claude_scan is enabled in settings.yaml but ANTHROPIC_API_KEY is not set.\n" +
-				"Either export ANTHROPIC_API_KEY or set `claude_scan: false` in settings.yaml")
-		}
-	}
-
-	if c.Features.VTFallback && !c.NoVT {
-		if os.Getenv("VIRUSTOTAL_API_KEY") == "" {
-			return fmt.Errorf("features.vt_fallback is enabled in settings.yaml but VIRUSTOTAL_API_KEY is not set.\n" +
-				"Either export VIRUSTOTAL_API_KEY or set `vt_fallback: false` in settings.yaml")
-		}
-	}
-
+	// Ollama runs locally, no API key needed
+	// Validation happens at runtime when the client is created
 	return nil
 }
 
-// IsClaudeEnabled returns true if Claude scanning is enabled and not overridden
-func (c *Config) IsClaudeEnabled() bool {
-	return c.Features.ClaudeScan && !c.NoClaude
-}
-
-// IsVTEnabled returns true if VirusTotal fallback is enabled and not overridden
-func (c *Config) IsVTEnabled() bool {
-	return c.Features.VTFallback && !c.NoVT
+// IsOllamaEnabled returns true if Ollama scanning is enabled and not overridden
+func (c *Config) IsOllamaEnabled() bool {
+	return c.Features.OllamaScan && !c.NoOllama
 }
 
 // CellarPath returns the path to the Homebrew Cellar
@@ -168,31 +135,24 @@ homebrew_path: /opt/homebrew
 
 # Feature flags - enable optional scanning features
 features:
-  # Enable Claude formula analysis (requires ANTHROPIC_API_KEY env var)
-  claude_scan: false
-  # Enable VirusTotal fallback for --circl-full (requires VIRUSTOTAL_API_KEY env var)
-  vt_fallback: false
+  # Enable Ollama LLM analysis (requires Ollama running locally)
+  # Install: brew install ollama && ollama pull gemma3
+  ollama_scan: false
 
-# Claude model to use for analysis
-claude_model: claude-sonnet-4-6
+# Ollama server URL (default: http://localhost:11434)
+ollama_url: http://localhost:11434
 
-# Maximum formula file size in bytes sent to Claude
-claude_max_file_bytes: 12000
+# Ollama model to use for analysis (default: gemma3)
+# Other options: llama3, mistral, codellama, etc.
+ollama_model: gemma3
+
+# Maximum formula file size in bytes sent to Ollama
+ollama_max_file_bytes: 12000
 
 # Blocking policy - which signals block an upgrade
 block_policy:
-  claude_formula_hold: true   # Block if Claude formula analysis returns HOLD
-  vt_confirmed: true          # Block if CIRCL flags AND VT confirms malicious
-  claude_code_hold: true      # Block if Claude code analysis returns HOLD
-  require_both: false         # If true, BOTH pre and post signals must fire to block
-
-# Hash verification settings (used with --circl-full flag)
-hash_check:
-  circl_url: https://hashlookup.circl.lu
-
-# VirusTotal rate limiting (free tier: 4/min, 500/day)
-vt_rate_limit_per_minute: 4
-vt_daily_limit: 500
+  ollama_formula_hold: true   # Block if Ollama formula analysis returns HOLD
+  ollama_code_hold: true      # Block if Ollama code analysis returns HOLD
 `
 
 // GenerateConfigFile creates a default config file in the binary directory

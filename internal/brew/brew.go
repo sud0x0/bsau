@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/sud0x0/bsau/internal/claude"
+	"github.com/sud0x0/bsau/internal/ollama"
 )
 
 // Package represents a Homebrew package
@@ -96,7 +96,7 @@ func (c *Client) GetFormulaPath(pkg string) (string, error) {
 }
 
 // GetFormulaVersions retrieves the last 3 versions of a formula from git history
-func (c *Client) GetFormulaVersions(pkg string) ([]claude.FormulaVersion, error) {
+func (c *Client) GetFormulaVersions(pkg string) ([]ollama.FormulaVersion, error) {
 	formulaPath, err := c.GetFormulaPath(pkg)
 	if err != nil {
 		return nil, err
@@ -125,7 +125,7 @@ func (c *Client) GetFormulaVersions(pkg string) ([]claude.FormulaVersion, error)
 		if err != nil {
 			return nil, fmt.Errorf("reading formula: %w", err)
 		}
-		return []claude.FormulaVersion{{
+		return []ollama.FormulaVersion{{
 			Label:   "CURRENT",
 			Content: string(content),
 		}}, nil
@@ -137,14 +137,14 @@ func (c *Client) GetFormulaVersions(pkg string) ([]claude.FormulaVersion, error)
 		if err != nil {
 			return nil, fmt.Errorf("reading formula: %w", err)
 		}
-		return []claude.FormulaVersion{{
+		return []ollama.FormulaVersion{{
 			Label:   "CURRENT",
 			Content: string(content),
 		}}, nil
 	}
 
 	labels := []string{"CURRENT", "PREVIOUS", "TWO_VERSIONS_AGO"}
-	versions := make([]claude.FormulaVersion, 0, len(lines))
+	versions := make([]ollama.FormulaVersion, 0, len(lines))
 
 	for i, line := range lines {
 		if i >= 3 {
@@ -161,7 +161,7 @@ func (c *Client) GetFormulaVersions(pkg string) ([]claude.FormulaVersion, error)
 			continue
 		}
 
-		versions = append(versions, claude.FormulaVersion{
+		versions = append(versions, ollama.FormulaVersion{
 			Label:   labels[i],
 			SHA:     sha,
 			Content: string(content),
@@ -174,7 +174,7 @@ func (c *Client) GetFormulaVersions(pkg string) ([]claude.FormulaVersion, error)
 		if err != nil {
 			return nil, fmt.Errorf("reading formula: %w", err)
 		}
-		return []claude.FormulaVersion{{
+		return []ollama.FormulaVersion{{
 			Label:   "CURRENT",
 			Content: string(content),
 		}}, nil

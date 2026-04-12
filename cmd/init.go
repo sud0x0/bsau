@@ -15,7 +15,7 @@ var initCmd = &cobra.Command{
 directory as the bsau binary.
 
 This command creates a new config file with default settings. You can then
-edit it to enable features like Claude analysis or VirusTotal fallback.
+edit it to enable features like Ollama analysis or VirusTotal fallback.
 
 The config file location is determined by where the bsau binary is installed.`,
 	RunE: runInit,
@@ -41,7 +41,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	ui.PrintSuccess(fmt.Sprintf("Config file created at: %s", configPath))
 	fmt.Println()
 	fmt.Println("Edit this file to enable optional features:")
-	fmt.Println("  - Set 'features.claude_scan: true' and export ANTHROPIC_API_KEY")
+	fmt.Println("  - Set 'features.ollama_scan: true' (requires Ollama running: ollama serve)")
 	fmt.Println("  - Set 'features.vt_fallback: true' and export VIRUSTOTAL_API_KEY")
 
 	return nil

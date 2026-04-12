@@ -74,8 +74,8 @@ type VulnEntry struct {
 	Severity string
 }
 
-// OSVAPIClient queries OSV and NIST APIs for vulnerabilities
-type OSVAPIClient struct {
+// Scanner queries OSV and NIST NVD APIs for vulnerabilities
+type Scanner struct {
 	httpClient *http.Client
 }
 
@@ -179,9 +179,9 @@ type nvdCVSSData struct {
 	BaseSeverity string  `json:"baseSeverity,omitempty"`
 }
 
-// NewOSVAPIClient creates a new OSV API client
-func NewOSVAPIClient() *OSVAPIClient {
-	return &OSVAPIClient{
+// NewScanner creates a new vulnerability scanner client
+func NewScanner() *Scanner {
+	return &Scanner{
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -195,7 +195,7 @@ func GetPackageMapping(brewName string) *PackageMapping {
 }
 
 // QueryPackages queries OSV and NIST NVD for vulnerabilities affecting packages.
-func (c *OSVAPIClient) QueryPackages(packages []PackageInfo) (map[string]*VulnResult, *QueryStats, error) {
+func (s *Scanner) QueryPackages(packages []PackageInfo) (map[string]*VulnResult, *QueryStats, error) {
 	results := make(map[string]*VulnResult)
 	stats := &QueryStats{}
 
@@ -233,7 +233,7 @@ func (c *OSVAPIClient) QueryPackages(packages []PackageInfo) (map[string]*VulnRe
 	}
 
 	if len(osvPackages) > 0 {
-		osvResults, osvStats, err := c.queryOSV(osvPackages, osvPackageToMapping)
+		osvResults, osvStats, err := s.queryOSV(osvPackages, osvPackageToMapping)
 		if err != nil {
 			return nil, stats, fmt.Errorf("OSV query failed: %w", err)
 		}
@@ -248,7 +248,7 @@ func (c *OSVAPIClient) QueryPackages(packages []PackageInfo) (map[string]*VulnRe
 	}
 
 	if len(nvdPackages) > 0 {
-		nvdResults, nvdStats := c.queryNVD(nvdPackages, nvdPackageToMapping)
+		nvdResults, nvdStats := s.queryNVD(nvdPackages, nvdPackageToMapping)
 		for name, result := range nvdResults {
 			results[name] = result
 		}
@@ -260,7 +260,7 @@ func (c *OSVAPIClient) QueryPackages(packages []PackageInfo) (map[string]*VulnRe
 	return results, stats, nil
 }
 
-func (c *OSVAPIClient) queryOSV(packages []PackageInfo, mappings map[string]*PackageMapping) (map[string]*VulnResult, *QueryStats, error) {
+func (s *Scanner) queryOSV(packages []PackageInfo, mappings map[string]*PackageMapping) (map[string]*VulnResult, *QueryStats, error) {
 	results := make(map[string]*VulnResult)
 	stats := &QueryStats{}
 
@@ -293,7 +293,7 @@ func (c *OSVAPIClient) queryOSV(packages []PackageInfo, mappings map[string]*Pac
 		return nil, stats, fmt.Errorf("marshaling request: %w", err)
 	}
 
-	resp, err := c.httpClient.Post(osvBatchURL, "application/json", bytes.NewReader(jsonBody))
+	resp, err := s.httpClient.Post(osvBatchURL, "application/json", bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, stats, fmt.Errorf("OSV API request failed: %w", err)
 	}
@@ -320,7 +320,7 @@ func (c *OSVAPIClient) queryOSV(packages []PackageInfo, mappings map[string]*Pac
 	}
 
 	stats.TotalVulns = len(vulnIDs)
-	vulnDetails, fetchErrors := c.fetchVulnDetailsConcurrent(vulnIDs)
+	vulnDetails, fetchErrors := s.fetchVulnDetailsConcurrent(vulnIDs)
 	stats.FetchErrors = fetchErrors
 
 	for i, brewName := range queryOrder {
@@ -359,7 +359,7 @@ func (c *OSVAPIClient) queryOSV(packages []PackageInfo, mappings map[string]*Pac
 	return results, stats, nil
 }
 
-func (c *OSVAPIClient) queryNVD(packages []PackageInfo, mappings map[string]*PackageMapping) (map[string]*VulnResult, *QueryStats) {
+func (s *Scanner) queryNVD(packages []PackageInfo, mappings map[string]*PackageMapping) (map[string]*VulnResult, *QueryStats) {
 	results := make(map[string]*VulnResult)
 	stats := &QueryStats{}
 
@@ -373,7 +373,7 @@ func (c *OSVAPIClient) queryNVD(packages []PackageInfo, mappings map[string]*Pac
 			time.Sleep(nvdRateLimitDelay)
 		}
 
-		vulns, err := c.queryNVDForPackage(pkg, mapping)
+		vulns, err := s.queryNVDForPackage(pkg, mapping)
 		if err != nil {
 			fmt.Printf("[WARN] NVD query failed for %s: %v\n", pkg.Name, err)
 			results[pkg.Name] = &VulnResult{
@@ -405,7 +405,7 @@ func (c *OSVAPIClient) queryNVD(packages []PackageInfo, mappings map[string]*Pac
 	return results, stats
 }
 
-func (c *OSVAPIClient) queryNVDForPackage(pkg PackageInfo, mapping *PackageMapping) ([]VulnEntry, error) {
+func (s *Scanner) queryNVDForPackage(pkg PackageInfo, mapping *PackageMapping) ([]VulnEntry, error) {
 	version := cleanVersion(pkg.Version)
 	cpe := fmt.Sprintf("cpe:2.3:a:%s:%s:%s:*:*:*:*:*:*:*",
 		mapping.CPEVendor, mapping.CPEProduct, version)
@@ -421,7 +421,7 @@ func (c *OSVAPIClient) queryNVDForPackage(pkg PackageInfo, mapping *PackageMappi
 	}
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("NVD API request failed: %w", err)
 	}
@@ -475,7 +475,7 @@ func extractSeverityFromNVD(metrics nvdMetrics) string {
 	return "UNKNOWN"
 }
 
-func (c *OSVAPIClient) fetchVulnDetailsConcurrent(vulnIDs []string) (map[string]*osvVulnDetail, int) {
+func (s *Scanner) fetchVulnDetailsConcurrent(vulnIDs []string) (map[string]*osvVulnDetail, int) {
 	results := make(map[string]*osvVulnDetail)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -496,7 +496,7 @@ func (c *OSVAPIClient) fetchVulnDetailsConcurrent(vulnIDs []string) (map[string]
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			detail, err := c.fetchVulnDetailWithContext(ctx, id)
+			detail, err := s.fetchVulnDetailWithContext(ctx, id)
 			if err != nil {
 				atomic.AddInt64(&errorCount, 1)
 				return
@@ -511,7 +511,7 @@ func (c *OSVAPIClient) fetchVulnDetailsConcurrent(vulnIDs []string) (map[string]
 	return results, int(errorCount)
 }
 
-func (c *OSVAPIClient) fetchVulnDetailWithContext(ctx context.Context, vulnID string) (*osvVulnDetail, error) {
+func (s *Scanner) fetchVulnDetailWithContext(ctx context.Context, vulnID string) (*osvVulnDetail, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, perRequestTimeout)
 	defer cancel()
 
@@ -520,7 +520,7 @@ func (c *OSVAPIClient) fetchVulnDetailWithContext(ctx context.Context, vulnID st
 		return nil, fmt.Errorf("creating request for %s: %w", vulnID, err)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetching vuln %s: %w", vulnID, err)
 	}
@@ -709,4 +709,89 @@ func cleanVersion(version string) string {
 		}
 	}
 	return version
+}
+
+// GenerateVulnReport creates a detailed text report of vulnerabilities organized by package
+func GenerateVulnReport(results map[string]*VulnResult) string {
+	var sb strings.Builder
+
+	sb.WriteString("=" + strings.Repeat("=", 79) + "\n")
+	sb.WriteString("                    VULNERABILITY REPORT\n")
+	sb.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
+
+	// Count total vulnerabilities
+	totalVulns := 0
+	packagesWithVulns := 0
+	for _, result := range results {
+		if result.CVECount > 0 {
+			totalVulns += result.CVECount
+			packagesWithVulns++
+		}
+	}
+
+	fmt.Fprintf(&sb, "Total Vulnerabilities Found: %d\n", totalVulns)
+	fmt.Fprintf(&sb, "Packages Affected: %d\n", packagesWithVulns)
+	sb.WriteString("\n" + strings.Repeat("-", 80) + "\n\n")
+
+	// Sort package names for consistent output
+	var pkgNames []string
+	for name := range results {
+		pkgNames = append(pkgNames, name)
+	}
+	// Simple sort
+	for i := 0; i < len(pkgNames); i++ {
+		for j := i + 1; j < len(pkgNames); j++ {
+			if pkgNames[i] > pkgNames[j] {
+				pkgNames[i], pkgNames[j] = pkgNames[j], pkgNames[i]
+			}
+		}
+	}
+
+	for _, pkgName := range pkgNames {
+		result := results[pkgName]
+
+		fmt.Fprintf(&sb, "PACKAGE: %s\n", result.Package)
+		fmt.Fprintf(&sb, "Version: %s\n", result.Version)
+		fmt.Fprintf(&sb, "Max Severity: %s\n", result.MaxSeverity)
+		fmt.Fprintf(&sb, "CVE Count: %d\n", result.CVECount)
+
+		if len(result.Vulns) == 0 {
+			if result.MaxSeverity == ui.SeverityNA {
+				sb.WriteString("Status: No vulnerability data available (package not in OSV/NVD)\n")
+			} else {
+				sb.WriteString("Status: No known vulnerabilities\n")
+			}
+		} else {
+			sb.WriteString("\nVulnerabilities:\n")
+			for i, v := range result.Vulns {
+				fmt.Fprintf(&sb, "\n  [%d] %s\n", i+1, v.ID)
+				fmt.Fprintf(&sb, "      Severity: %s\n", v.Severity)
+
+				// Generate appropriate link based on ID format
+				if strings.HasPrefix(v.ID, "CVE-") {
+					fmt.Fprintf(&sb, "      Link: https://nvd.nist.gov/vuln/detail/%s\n", v.ID)
+				} else if strings.HasPrefix(v.ID, "GHSA-") {
+					fmt.Fprintf(&sb, "      Link: https://github.com/advisories/%s\n", v.ID)
+				} else {
+					fmt.Fprintf(&sb, "      Link: https://osv.dev/vulnerability/%s\n", v.ID)
+				}
+
+				if v.Summary != "" {
+					// Wrap summary at 70 chars for readability
+					summary := v.Summary
+					if len(summary) > 200 {
+						summary = summary[:197] + "..."
+					}
+					fmt.Fprintf(&sb, "      Summary: %s\n", summary)
+				}
+			}
+		}
+		sb.WriteString("\n" + strings.Repeat("-", 80) + "\n\n")
+	}
+
+	sb.WriteString("=" + strings.Repeat("=", 79) + "\n")
+	sb.WriteString("                    END OF REPORT\n")
+	sb.WriteString("=" + strings.Repeat("=", 79) + "\n")
+
+	return sb.String()
 }

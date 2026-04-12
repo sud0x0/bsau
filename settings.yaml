@@ -3,34 +3,24 @@
 # Path to Homebrew installation. Defaults to /opt/homebrew (Apple Silicon).
 homebrew_path: /opt/homebrew
 
-# Hash verification strategy.
-# CIRCL hashlookup is always the primary check — free, no API key, no rate limits.
-# VirusTotal is only called for hashes that CIRCL flags as malicious.
-hash_check:
-  circl_url: https://hashlookup.circl.lu
-
-# Feature flags — opt-in to scans that require external API keys.
-# CIRCL hash scanning and OSV vulnerability scanning always run without any key.
+# Feature flags — opt-in to scans that require external dependencies.
+# OSV vulnerability scanning always runs without any key.
 features:
-  claude_scan: false      # Requires ANTHROPIC_API_KEY
-  vt_fallback: false      # Requires VIRUSTOTAL_API_KEY — used only for CIRCL-malicious hashes
+  ollama_scan: false      # Requires Ollama running locally (ollama serve)
 
 # Blocking policy.
-# Pre-install (Step 3): Claude formula analysis only.
-# Post-install (Step 6a): CIRCL+VT hash results and Semgrep+Claude code scan.
+# Pre-install (Step 3): Ollama formula analysis.
+# Post-install (Step 6a): Semgrep + Ollama code scan.
 block_policy:
-  claude_formula_hold: true   # Block if Claude formula analysis returns HOLD (Step 3)
-  vt_confirmed: true          # Block if CIRCL flags AND VT confirms on new binary (Step 6a)
-  claude_code_hold: true      # Block if Claude code analysis returns HOLD (Step 6a)
-  require_both: false         # If true, BOTH pre and post signals must fire to block
+  ollama_formula_hold: true   # Block if Ollama formula analysis returns HOLD (Step 3)
+  ollama_code_hold: true      # Block if Ollama code analysis returns HOLD (Step 6a)
 
-# Claude model to use for analysis
-claude_model: claude-sonnet-4-6
+# Ollama server URL (default: http://localhost:11434)
+ollama_url: http://localhost:11434
 
-# Maximum file size in bytes sent to Claude. Larger files are truncated.
-claude_max_file_bytes: 12000
+# Ollama model to use for analysis (default: gemma3)
+# Requires: ollama pull gemma3
+ollama_model: gemma3
 
-# VirusTotal rate limiting (free tier: 4/min, 500/day).
-# In practice VT is only called for CIRCL-malicious hashes so limits are rarely hit.
-vt_rate_limit_per_minute: 4
-vt_daily_limit: 500
+# Maximum file size in bytes sent to Ollama. Larger files are truncated.
+ollama_max_file_bytes: 12000

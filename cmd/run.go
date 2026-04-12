@@ -4,10 +4,8 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-	"github.com/sud0x0/bsau/internal/bloom"
 	"github.com/sud0x0/bsau/internal/brew"
-	"github.com/sud0x0/bsau/internal/claude"
-	"github.com/sud0x0/bsau/internal/hashlookup"
+	"github.com/sud0x0/bsau/internal/ollama"
 	"github.com/sud0x0/bsau/internal/semgrep"
 	"github.com/sud0x0/bsau/internal/snapshot"
 	"github.com/sud0x0/bsau/internal/state"
@@ -16,9 +14,7 @@ import (
 )
 
 var (
-	noClaude bool
-	noVT     bool
-	noCIRCL  bool
+	noOllama bool
 	dryRun   bool
 )
 
@@ -29,27 +25,22 @@ var runCmd = &cobra.Command{
 
 1. Identify and audit current state (packages, CVEs)
 2. Identify what needs to be updated
-3. Pre-install security scan (Claude formula analysis)
+3. Pre-install security scan (Ollama formula analysis)
 4. Per-package approval gate
 5. Upgrade approved packages (with pre-upgrade snapshot)
-6. Post-install verification (Semgrep, Claude code analysis)
-
-Bloom filter hash verification is prompted during the run. Use --no-circl to skip.
-You can also run hash checks separately with: bsau inspect --circl`,
+6. Post-install verification (Semgrep, Ollama code analysis)
+7. Cleanup`,
 	RunE: runWorkflow,
 }
 
 func init() {
-	runCmd.Flags().BoolVar(&noClaude, "no-claude", false, "skip Claude analysis for this run")
-	runCmd.Flags().BoolVar(&noVT, "no-vt", false, "skip VirusTotal fallback for this run")
-	runCmd.Flags().BoolVar(&noCIRCL, "no-circl", false, "skip CIRCL bloom filter hash verification")
+	runCmd.Flags().BoolVar(&noOllama, "no-ollama", false, "skip Ollama analysis for this run")
 	runCmd.Flags().BoolVar(&dryRun, "dry-run", false, "run scans but do not upgrade")
 }
 
 func runWorkflow(cmd *cobra.Command, args []string) error {
 	// Apply CLI overrides
-	cfg.NoClaude = noClaude
-	cfg.NoVT = noVT
+	cfg.NoOllama = noOllama
 	cfg.DryRun = dryRun
 
 	// Initialize run manager (creates /tmp/bsau-<run-id>/)
@@ -70,7 +61,7 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 
 	// Initialize clients
 	brewClient := brew.NewClient(cfg.HomebrewPath)
-	osvAPIClient := vuln.NewOSVAPIClient()
+	vulnScanner := vuln.NewScanner()
 	prompter := ui.NewPrompter()
 
 	// Track failures throughout the workflow
@@ -110,7 +101,7 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	vulnResults, vulnStats, err := osvAPIClient.QueryPackages(packageInfos)
+	vulnResults, vulnStats, err := vulnScanner.QueryPackages(packageInfos)
 	if err != nil {
 		ui.PrintWarning(fmt.Sprintf("OSV API query failed: %v", err))
 		// Create placeholder results for all packages
@@ -152,9 +143,19 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 		ui.PrintWarning(fmt.Sprintf("Failed to save pre-update vuln state: %v", err))
 	}
 
+	// Generate detailed vulnerability report
+	vulnReport := vuln.GenerateVulnReport(vulnResults)
+	if err := runMgr.SaveVulnReport(vulnReport); err != nil {
+		ui.PrintWarning(fmt.Sprintf("Failed to save vulnerability report: %v", err))
+	}
+
 	// === Step 2: Identify what needs to be updated ===
 	ui.PrintStep(2, 7, "Identify What Needs to Be Updated",
 		"Displaying outdated packages with vulnerability info. Select which packages to update.")
+
+	// Display link to detailed vulnerability report
+	ui.PrintInfo(fmt.Sprintf("Detailed vulnerability report: %s", runMgr.VulnReportPath()))
+	ui.PrintInfo("(Note: This file will be deleted when bsau exits)")
 
 	// Warn about skipped packages (no GitHub URL or unsupported registry)
 	if vulnStats != nil && vulnStats.PackagesSkipped > 0 {
@@ -249,52 +250,55 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// === Step 3: Pre-install security scan (Claude formula analysis) ===
+	// === Step 3: Pre-install security scan (Ollama formula analysis) ===
 	ui.PrintStep(3, 7, "Pre-install Security Scan",
-		"Analyzing formula files with Claude to detect malicious patterns before upgrade.")
+		"Analyzing formula files with Ollama to detect malicious patterns before upgrade.")
 
-	var claudeClient *claude.Client
-	formulaResults := make(map[string]*claude.FormulaAnalysisResult)
+	var ollamaClient *ollama.Client
+	formulaResults := make(map[string]*ollama.FormulaAnalysisResult)
 
 	// Show scan status
 	fmt.Println("Scan status:")
-	if !cfg.IsClaudeEnabled() {
-		ui.PrintSkipped("Claude formula analysis: disabled (enable with 'claude_scan: true' in settings.yaml)")
+	if !cfg.IsOllamaEnabled() {
+		ui.PrintSkipped("Ollama formula analysis: disabled (enable with 'ollama_scan: true' in settings.yaml)")
 		fmt.Println()
 	} else {
-		ui.PrintInfo("Claude formula analysis: enabled")
+		ui.PrintInfo("Ollama formula analysis: enabled")
 		fmt.Println()
-		var err error
-		claudeClient, err = claude.NewClient(cfg.ClaudeModel, cfg.ClaudeMaxFileBytes)
-		if err != nil {
-			ui.PrintWarning(fmt.Sprintf("Failed to initialize Claude client: %v", err))
-			ui.PrintWarning("Continuing without Claude analysis...")
-		} else {
-			claudeProgress := ui.NewProgress("Analyzing formulas", len(selectedPkgs))
+		ollamaClient = ollama.NewClient(cfg.OllamaURL, cfg.OllamaModel, cfg.OllamaMaxFileBytes)
+		// Check if Ollama is actually running
+		if err := ollamaClient.CheckAvailability(); err != nil {
+			ui.PrintWarning(fmt.Sprintf("Ollama not available: %v", err))
+			ui.PrintWarning("Make sure Ollama is running with: ollama serve")
+			ollamaClient = nil
+		}
+
+		if ollamaClient != nil {
+			ollamaProgress := ui.NewProgress("Analyzing formulas", len(selectedPkgs))
 			for _, pkgName := range selectedPkgs {
-				claudeProgress.Update(pkgName)
+				ollamaProgress.Update(pkgName)
 				versions, err := brewClient.GetFormulaVersions(pkgName)
 				if err != nil {
-					claudeProgress.Clear()
+					ollamaProgress.Clear()
 					ui.PrintWarning(fmt.Sprintf("Failed to get formula for %s: %v", pkgName, err))
 					continue
 				}
 
-				result, err := claudeClient.AnalyzeFormula(pkgName, versions)
+				result, err := ollamaClient.AnalyzeFormula(pkgName, versions)
 				if err != nil {
-					claudeProgress.Clear()
-					ui.PrintWarning(fmt.Sprintf("Claude analysis failed for %s: %v", pkgName, err))
-					result = &claude.FormulaAnalysisResult{
+					ollamaProgress.Clear()
+					ui.PrintWarning(fmt.Sprintf("Ollama analysis failed for %s: %v", pkgName, err))
+					result = &ollama.FormulaAnalysisResult{
 						Package: pkgName,
-						Verdict: claude.VerdictReview,
+						Verdict: ollama.VerdictReview,
 					}
 				}
 				formulaResults[pkgName] = result
 			}
-			claudeProgress.Done()
+			ollamaProgress.Done()
 		}
 
-		// Save Claude formula analysis results to run-scoped state
+		// Save Ollama formula analysis results to run-scoped state
 		scanResults := make(map[string]interface{})
 		for name, result := range formulaResults {
 			scanResults[name] = map[string]interface{}{
@@ -321,18 +325,18 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 		fr := formulaResults[pkgName]
 
 		recommendation := "PROCEED"
-		var verdict claude.Verdict
+		var verdict ollama.Verdict
 
 		if fr != nil {
 			verdict = fr.Verdict
 			switch verdict {
-			case claude.VerdictHold:
-				if cfg.BlockPolicy.ClaudeFormulaHold {
+			case ollama.VerdictHold:
+				if cfg.BlockPolicy.OllamaFormulaHold {
 					recommendation = "BLOCK"
 				} else {
 					recommendation = "REVIEW"
 				}
-			case claude.VerdictReview:
+			case ollama.VerdictReview:
 				recommendation = "REVIEW"
 			}
 		}
@@ -340,23 +344,23 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 		preInstallRows = append(preInstallRows, ui.PreInstallRow{
 			Package:        pkgName,
 			CVECount:       vr.CVECount,
-			ClaudeVerdict:  verdict,
+			OllamaVerdict:  verdict,
 			Recommendation: recommendation,
 		})
 	}
 
 	fmt.Println()
-	ui.RenderPreInstallTable(preInstallRows, cfg.IsClaudeEnabled())
+	ui.RenderPreInstallTable(preInstallRows, cfg.IsOllamaEnabled())
 
 	// Process approvals
 	for _, row := range preInstallRows {
 		if row.Recommendation == "BLOCK" {
-			ui.PrintWarning(fmt.Sprintf("Package %s blocked: Claude returned HOLD verdict", row.Package))
+			ui.PrintWarning(fmt.Sprintf("Package %s blocked: Ollama returned HOLD verdict", row.Package))
 			continue
 		}
 
 		if row.Recommendation == "REVIEW" {
-			approved, err := prompter.ConfirmPackageUpgrade(row.Package, row.ClaudeVerdict, "Requires manual review")
+			approved, err := prompter.ConfirmPackageUpgrade(row.Package, row.OllamaVerdict, "Requires manual review")
 			if err != nil {
 				return fmt.Errorf("confirming upgrade: %w", err)
 			}
@@ -470,83 +474,10 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 
 	// === Step 6: Post-install verification ===
 	ui.PrintStep(6, 7, "Post-Install Verification",
-		"Verifying upgraded packages with Semgrep scan and Claude code analysis.")
+		"Verifying upgraded packages with Semgrep scan and Ollama code analysis.")
 
 	// Show scan status
 	fmt.Println("Scan status:")
-
-	// CIRCL bloom filter hash check
-	var bloomChecker *hashlookup.BloomChecker
-	runCIRCLScan := false
-
-	if noCIRCL {
-		ui.PrintSkipped("Bloom filter hash check: disabled (--no-circl)")
-	} else if bloom.Exists() {
-		// Bloom filter already downloaded, ask if user wants to run the scan
-		runCIRCLScan, _ = prompter.Confirm("Run CIRCL bloom filter hash verification?", true)
-		if runCIRCLScan {
-			var err error
-			bloomChecker, err = hashlookup.NewBloomChecker()
-			if err != nil {
-				ui.PrintSkipped(fmt.Sprintf("Bloom filter: failed to load (%v)", err))
-			} else {
-				// Check if server has a newer version
-				updateInfo, err := bloom.CheckForUpdate()
-				if err != nil {
-					ui.PrintWarning(fmt.Sprintf("Could not check for bloom filter updates: %v", err))
-				} else if updateInfo.Available {
-					ui.PrintWarning("Bloom filter update available (server ETag changed)")
-					proceed, _ := prompter.Confirm("Update now?", false)
-					if proceed {
-						ui.PrintInfo("Downloading updated bloom filter...")
-						if err := bloom.Download(func(downloaded, total int64) {
-							pct := float64(downloaded) / float64(total) * 100
-							fmt.Printf("\rDownloading: %s / %s (%.1f%%)",
-								bloom.FormatSize(downloaded), bloom.FormatSize(total), pct)
-						}); err != nil {
-							fmt.Println()
-							ui.PrintError(fmt.Sprintf("Failed to update bloom filter: %v", err))
-						} else {
-							fmt.Println()
-							ui.PrintSuccess("Bloom filter updated")
-							bloomChecker, _ = hashlookup.NewBloomChecker()
-						}
-					}
-				}
-				ui.PrintInfo(fmt.Sprintf("Bloom filter hash check: enabled (%s)", bloomChecker.AgeInfo()))
-			}
-		} else {
-			ui.PrintSkipped("Bloom filter hash check: skipped")
-		}
-	} else {
-		// Bloom filter not downloaded yet
-		fmt.Println()
-		ui.PrintInfo("CIRCL bloom filter hash verification is available but not downloaded.")
-		fmt.Println("  - Download size: ~700 MB (may take an hour or more)")
-		fmt.Println("  - You can skip this and run later with: bsau inspect --circl")
-		fmt.Println()
-		runCIRCLScan, _ = prompter.Confirm("Download and run CIRCL scan now?", false)
-		if runCIRCLScan {
-			bloomPath, _ := bloom.GetBloomPath()
-			fmt.Printf("URL: %s\n", bloom.BloomURL)
-			fmt.Printf("Location: %s\n", bloomPath)
-			ui.PrintInfo("Downloading bloom filter...")
-			err := bloom.Download(func(downloaded, total int64) {
-				pct := float64(downloaded) / float64(total) * 100
-				fmt.Printf("\rDownloading: %s / %s (%.1f%%)",
-					bloom.FormatSize(downloaded), bloom.FormatSize(total), pct)
-			})
-			fmt.Println()
-			if err != nil {
-				ui.PrintError(fmt.Sprintf("Failed to download bloom filter: %v", err))
-			} else {
-				ui.PrintSuccess("Bloom filter downloaded successfully")
-				bloomChecker, _ = hashlookup.NewBloomChecker()
-			}
-		} else {
-			ui.PrintSkipped("Bloom filter hash check: skipped (run later with: bsau inspect --circl)")
-		}
-	}
 
 	// Initialize Semgrep
 	var semgrepRunner *semgrep.Runner
@@ -560,11 +491,11 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Claude code analysis status
-	if cfg.IsClaudeEnabled() && claudeClient != nil {
-		ui.PrintInfo("Claude code analysis: enabled")
+	// Ollama code analysis status
+	if cfg.IsOllamaEnabled() && ollamaClient != nil {
+		ui.PrintInfo("Ollama code analysis: enabled")
 	} else {
-		ui.PrintSkipped("Claude code analysis: disabled (enable with 'claude_scan: true' in settings.yaml)")
+		ui.PrintSkipped("Ollama code analysis: disabled (enable with 'ollama_scan: true' in settings.yaml)")
 	}
 	fmt.Println()
 
@@ -572,57 +503,14 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 	semgrepResultsMap := make(map[string]interface{})
 
 	verifyProgress := ui.NewProgress("Verifying packages", len(upgraded))
-	for pkgIdx, pkg := range upgraded {
+	for _, pkg := range upgraded {
 		verifyProgress.Update(pkg.Name)
 		row := ui.PostInstallRow{
 			Package: pkg.Name,
 			Overall: "OK",
 		}
 
-		// 6a-i: Bloom filter hash verification (fast, local)
-		if bloomChecker != nil {
-			// Progress callback to show file-level progress
-			// Use fmt.Printf directly to avoid incrementing package counter
-			bloomProgress := func(current, total int, filename string) {
-				// Skip output if signal handler is prompting user
-				if sigHandler.IsPrompting() {
-					return
-				}
-				// \033[K clears from cursor to end of line
-				fmt.Printf("\r\033[K%s[%d/%d]%s %s: bloom check [%d/%d] %s",
-					ui.ColorCyan, pkgIdx+1, len(upgraded), ui.ColorReset,
-					pkg.Name, current, total, truncateFilename(filename, 30))
-			}
-
-			bloomResult, err := bloomChecker.CheckPackageWithProgress(
-				brewClient.CellarPath(),
-				pkg.Name,
-				pkg.NewVersion,
-				bloomProgress,
-			)
-			if err != nil {
-				verifyProgress.Clear()
-				ui.PrintWarning(fmt.Sprintf("Bloom check failed for %s: %v", pkg.Name, err))
-				failures = append(failures, ui.ScanFailure{
-					Package: pkg.Name,
-					Step:    "Bloom Filter",
-					Error:   err.Error(),
-				})
-			} else {
-				// Bloom filter shows percentage of known vs unknown files
-				fmt.Printf("\r\033[K") // Clear the progress line
-				verifyProgress.Clear()
-				ui.PrintInfo(fmt.Sprintf("%s: %s", pkg.Name, bloomResult.Summary()))
-
-				// If many unknown files (>50%), flag for review
-				if bloomResult.TotalFiles > 0 &&
-					float64(bloomResult.UnknownCount)/float64(bloomResult.TotalFiles) > 0.5 {
-					row.Overall = "REVIEW"
-				}
-			}
-		}
-
-		// 6a-iii: Semgrep scan
+		// Semgrep scan
 		verifyProgress.Update(fmt.Sprintf("%s (semgrep)", pkg.Name))
 		if semgrepRunner != nil {
 			semgrepResult, err := semgrepRunner.ScanPackage(
@@ -652,8 +540,8 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// 6a-iv & 6a-v: Diff and Claude code analysis
-		if cfg.IsClaudeEnabled() && claudeClient != nil {
+		// Diff and Ollama code analysis
+		if cfg.IsOllamaEnabled() && ollamaClient != nil {
 			// Generate diff if we have a snapshot
 			snapshotPath := runMgr.PackageSnapshotDir(pkg.Name, pkg.OldVersion)
 			newPath := brewClient.PackagePath(pkg.Name, pkg.NewVersion)
@@ -668,20 +556,20 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 					}
 				}
 
-				codeResult, err := claudeClient.AnalyzeCode(pkg.Name, pkg.OldVersion, pkg.NewVersion, diff, semgrepFindings)
+				codeResult, err := ollamaClient.AnalyzeCode(pkg.Name, pkg.OldVersion, pkg.NewVersion, diff, semgrepFindings)
 				if err != nil {
-					ui.PrintWarning(fmt.Sprintf("Claude code analysis failed for %s: %v", pkg.Name, err))
+					ui.PrintWarning(fmt.Sprintf("Ollama code analysis failed for %s: %v", pkg.Name, err))
 					failures = append(failures, ui.ScanFailure{
 						Package: pkg.Name,
-						Step:    "Claude Code",
+						Step:    "Ollama Code",
 						Error:   err.Error(),
 					})
 				} else {
-					row.ClaudeVerdict = codeResult.Verdict
-					if codeResult.Verdict == claude.VerdictHold {
-						if cfg.BlockPolicy.ClaudeCodeHold {
+					row.OllamaVerdict = codeResult.Verdict
+					if codeResult.Verdict == ollama.VerdictHold {
+						if cfg.BlockPolicy.OllamaCodeHold {
 							row.Overall = "BLOCK"
-							ui.PrintError(fmt.Sprintf("Package %s flagged by Claude - consider `brew uninstall %s`", pkg.Name, pkg.Name))
+							ui.PrintError(fmt.Sprintf("Package %s flagged by Ollama - consider `brew uninstall %s`", pkg.Name, pkg.Name))
 						} else {
 							row.Overall = "REVIEW"
 						}
@@ -707,7 +595,7 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 	// === Post-update summary ===
 	ui.PrintInfo("Post-update summary:")
 	fmt.Println()
-	ui.RenderPostInstallTable(postInstallRows, cfg.IsVTEnabled(), cfg.IsClaudeEnabled())
+	ui.RenderPostInstallTable(postInstallRows, cfg.IsOllamaEnabled())
 
 	// Re-check vulnerabilities for summary using osv-scanner
 	cvesResolved := 0
@@ -732,7 +620,7 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 	}
 
 	ui.PrintInfo("Checking post-upgrade vulnerabilities...")
-	postVulnResults, postVulnStats, err := osvAPIClient.QueryPackages(postPackageInfos)
+	postVulnResults, postVulnStats, err := vulnScanner.QueryPackages(postPackageInfos)
 	if err != nil {
 		ui.PrintWarning(fmt.Sprintf("Post-upgrade OSV query failed: %v", err))
 		failures = append(failures, ui.ScanFailure{
@@ -791,12 +679,4 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 	ui.PrintSuccess("All done!")
 
 	return nil
-}
-
-// truncateFilename shortens a filename for display
-func truncateFilename(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen-3] + "..."
 }

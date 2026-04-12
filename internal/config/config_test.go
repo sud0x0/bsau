@@ -1,15 +1,14 @@
 package config
 
 import (
-	"os"
 	"testing"
 )
 
-func TestConfig_IsClaudeEnabled(t *testing.T) {
+func TestConfig_IsOllamaEnabled(t *testing.T) {
 	tests := []struct {
 		name       string
-		claudeScan bool
-		noClaude   bool
+		ollamaScan bool
+		noOllama   bool
 		expected   bool
 	}{
 		{"enabled and not overridden", true, false, true},
@@ -21,37 +20,11 @@ func TestConfig_IsClaudeEnabled(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := &Config{
-				Features: FeaturesConfig{ClaudeScan: tt.claudeScan},
-				NoClaude: tt.noClaude,
+				Features: FeaturesConfig{OllamaScan: tt.ollamaScan},
+				NoOllama: tt.noOllama,
 			}
-			if got := cfg.IsClaudeEnabled(); got != tt.expected {
-				t.Errorf("IsClaudeEnabled() = %v, expected %v", got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestConfig_IsVTEnabled(t *testing.T) {
-	tests := []struct {
-		name       string
-		vtFallback bool
-		noVT       bool
-		expected   bool
-	}{
-		{"enabled and not overridden", true, false, true},
-		{"enabled but overridden", true, true, false},
-		{"disabled", false, false, false},
-		{"disabled and overridden", false, true, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{
-				Features: FeaturesConfig{VTFallback: tt.vtFallback},
-				NoVT:     tt.noVT,
-			}
-			if got := cfg.IsVTEnabled(); got != tt.expected {
-				t.Errorf("IsVTEnabled() = %v, expected %v", got, tt.expected)
+			if got := cfg.IsOllamaEnabled(); got != tt.expected {
+				t.Errorf("IsOllamaEnabled() = %v, expected %v", got, tt.expected)
 			}
 		})
 	}
@@ -65,62 +38,45 @@ func TestConfig_CellarPath(t *testing.T) {
 	}
 }
 
-func TestConfig_Validate_ClaudeEnabled(t *testing.T) {
-	// Save and restore env
-	origKey := os.Getenv("ANTHROPIC_API_KEY")
-	defer func() { _ = os.Setenv("ANTHROPIC_API_KEY", origKey) }()
-
+func TestConfig_Validate(t *testing.T) {
+	// Ollama runs locally, no API key needed
 	cfg := &Config{
-		Features: FeaturesConfig{ClaudeScan: true},
+		Features: FeaturesConfig{OllamaScan: true},
 	}
 
-	// Without API key
-	_ = os.Unsetenv("ANTHROPIC_API_KEY")
-	if err := cfg.Validate(); err == nil {
-		t.Error("expected error when ANTHROPIC_API_KEY is not set")
-	}
-
-	// With API key
-	_ = os.Setenv("ANTHROPIC_API_KEY", "test-key")
+	// Should not return error for Ollama - it's local
 	if err := cfg.Validate(); err != nil {
-		t.Errorf("unexpected error: %v", err)
+		t.Errorf("unexpected error for Ollama (no API key needed): %v", err)
 	}
 }
 
-func TestConfig_Validate_VTEnabled(t *testing.T) {
-	// Save and restore env
-	origKey := os.Getenv("VIRUSTOTAL_API_KEY")
-	defer func() { _ = os.Setenv("VIRUSTOTAL_API_KEY", origKey) }()
+func TestConfig_Defaults(t *testing.T) {
+	// Test that defaults are properly set
+	cfg := &Config{}
 
-	cfg := &Config{
-		Features: FeaturesConfig{VTFallback: true},
+	// HomebrewPath should be empty by default (Load sets the default)
+	if cfg.HomebrewPath != "" {
+		t.Errorf("expected empty HomebrewPath, got %s", cfg.HomebrewPath)
 	}
 
-	// Without API key
-	_ = os.Unsetenv("VIRUSTOTAL_API_KEY")
-	if err := cfg.Validate(); err == nil {
-		t.Error("expected error when VIRUSTOTAL_API_KEY is not set")
-	}
-
-	// With API key
-	_ = os.Setenv("VIRUSTOTAL_API_KEY", "test-key")
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("unexpected error: %v", err)
+	// Features should be disabled by default
+	if cfg.Features.OllamaScan {
+		t.Error("expected OllamaScan to be false by default")
 	}
 }
 
-func TestConfig_Validate_Overridden(t *testing.T) {
+func TestConfig_BlockPolicy(t *testing.T) {
 	cfg := &Config{
-		Features: FeaturesConfig{
-			ClaudeScan: true,
-			VTFallback: true,
+		BlockPolicy: BlockPolicyConfig{
+			OllamaFormulaHold: true,
+			OllamaCodeHold:    true,
 		},
-		NoClaude: true,
-		NoVT:     true,
 	}
 
-	// Should not require API keys when features are overridden
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("unexpected error when features are overridden: %v", err)
+	if !cfg.BlockPolicy.OllamaFormulaHold {
+		t.Error("expected OllamaFormulaHold to be true")
+	}
+	if !cfg.BlockPolicy.OllamaCodeHold {
+		t.Error("expected OllamaCodeHold to be true")
 	}
 }

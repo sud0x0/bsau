@@ -1,6 +1,7 @@
 package vuln
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/sud0x0/bsau/internal/ui"
@@ -271,12 +272,117 @@ func TestGetPackageMapping_NotFound(t *testing.T) {
 	}
 }
 
-func TestNewOSVAPIClient(t *testing.T) {
-	client := NewOSVAPIClient()
+func TestNewScanner(t *testing.T) {
+	client := NewScanner()
 	if client == nil {
 		t.Fatal("expected non-nil client")
 	}
 	if client.httpClient == nil {
 		t.Error("expected non-nil httpClient")
+	}
+}
+
+func TestGenerateVulnReport_Empty(t *testing.T) {
+	results := make(map[string]*VulnResult)
+	report := GenerateVulnReport(results)
+
+	if !strings.Contains(report, "VULNERABILITY REPORT") {
+		t.Error("expected report to contain header")
+	}
+	if !strings.Contains(report, "Total Vulnerabilities Found: 0") {
+		t.Error("expected report to show 0 vulnerabilities")
+	}
+}
+
+func TestGenerateVulnReport_WithVulns(t *testing.T) {
+	results := map[string]*VulnResult{
+		"openssl": {
+			Package:     "openssl",
+			Version:     "3.0.0",
+			CVECount:    2,
+			MaxSeverity: ui.SeverityHigh,
+			Vulns: []VulnEntry{
+				{
+					ID:       "CVE-2023-1234",
+					Severity: "HIGH",
+					Summary:  "Test vulnerability",
+				},
+				{
+					ID:       "GHSA-abcd-1234-efgh",
+					Severity: "MEDIUM",
+					Summary:  "Another vulnerability",
+				},
+			},
+		},
+		"curl": {
+			Package:     "curl",
+			Version:     "8.0.0",
+			CVECount:    0,
+			MaxSeverity: ui.SeverityNone,
+			Vulns:       []VulnEntry{},
+		},
+	}
+
+	report := GenerateVulnReport(results)
+
+	// Check header
+	if !strings.Contains(report, "VULNERABILITY REPORT") {
+		t.Error("expected report to contain header")
+	}
+
+	// Check total count
+	if !strings.Contains(report, "Total Vulnerabilities Found: 2") {
+		t.Error("expected report to show 2 vulnerabilities")
+	}
+
+	// Check packages affected
+	if !strings.Contains(report, "Packages Affected: 1") {
+		t.Error("expected report to show 1 package affected")
+	}
+
+	// Check package info
+	if !strings.Contains(report, "PACKAGE: openssl") {
+		t.Error("expected report to contain openssl package")
+	}
+	if !strings.Contains(report, "PACKAGE: curl") {
+		t.Error("expected report to contain curl package")
+	}
+
+	// Check CVE link format
+	if !strings.Contains(report, "https://nvd.nist.gov/vuln/detail/CVE-2023-1234") {
+		t.Error("expected report to contain NVD link for CVE")
+	}
+
+	// Check GHSA link format
+	if !strings.Contains(report, "https://github.com/advisories/GHSA-abcd-1234-efgh") {
+		t.Error("expected report to contain GitHub advisory link")
+	}
+
+	// Check summary
+	if !strings.Contains(report, "Test vulnerability") {
+		t.Error("expected report to contain vulnerability summary")
+	}
+
+	// Check no vulns message
+	if !strings.Contains(report, "No known vulnerabilities") {
+		t.Error("expected report to show 'No known vulnerabilities' for curl")
+	}
+}
+
+func TestGenerateVulnReport_NAPackage(t *testing.T) {
+	results := map[string]*VulnResult{
+		"custom-pkg": {
+			Package:     "custom-pkg",
+			Version:     "1.0.0",
+			CVECount:    0,
+			MaxSeverity: ui.SeverityNA,
+			Vulns:       []VulnEntry{},
+		},
+	}
+
+	report := GenerateVulnReport(results)
+
+	if !strings.Contains(report, "No vulnerability data available") {
+		t.Error("expected report to show N/A status message")
 	}
 }
