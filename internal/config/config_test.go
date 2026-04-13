@@ -39,14 +39,29 @@ func TestConfig_CellarPath(t *testing.T) {
 }
 
 func TestConfig_Validate(t *testing.T) {
-	// Ollama runs locally, no API key needed
-	cfg := &Config{
-		Features: FeaturesConfig{OllamaScan: true},
+	tests := []struct {
+		name        string
+		ollamaScan  bool
+		ollamaModel string
+		wantErr     bool
+	}{
+		{"ollama disabled, no model", false, "", false},
+		{"ollama disabled, with model", false, "gemma3", false},
+		{"ollama enabled, with model", true, "gemma3", false},
+		{"ollama enabled, no model", true, "", true},
 	}
 
-	// Should not return error for Ollama - it's local
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("unexpected error for Ollama (no API key needed): %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Features:    FeaturesConfig{OllamaScan: tt.ollamaScan},
+				OllamaModel: tt.ollamaModel,
+			}
+			err := cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
 	}
 }
 

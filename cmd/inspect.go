@@ -2,12 +2,13 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/sud0x0/bsau/internal/brew"
+	"github.com/sud0x0/bsau/internal/logger"
 	"github.com/sud0x0/bsau/internal/ollama"
 	"github.com/sud0x0/bsau/internal/semgrep"
+	"github.com/sud0x0/bsau/internal/snapshot"
 	"github.com/sud0x0/bsau/internal/ui"
 	"github.com/sud0x0/bsau/internal/vuln"
 )
@@ -45,21 +46,31 @@ func init() {
 }
 
 func runInspect(cmd *cobra.Command, args []string) error {
+	// Close logger at the end
+	defer logger.Close()
+
 	// If no args and no --all flag, show help
 	if len(args) == 0 && !inspectAll {
 		return cmd.Help()
 	}
-
-	// Initialize signal handler for graceful CTRL+C handling
-	sigHandler := ui.NewSignalHandler()
-	sigHandler.Start()
-	defer sigHandler.Stop()
 
 	// Determine which checks to run based on config and flags
 	// By default, run all checks (vuln, Semgrep, Ollama if enabled)
 	runVulnCheck := !inspectNoVuln
 	runSemgrepCheck := !inspectNoSemgrep
 	runOllamaCheck := !inspectNoOllama && cfg.IsOllamaEnabled()
+
+	// If all scans are disabled, show error
+	if !runVulnCheck && !runSemgrepCheck && !runOllamaCheck {
+		ui.PrintError("No scans enabled. At least one scan type must be enabled.")
+		ui.PrintInfo("Remove one of: --no-vuln, --no-semgrep, --no-ollama")
+		return nil
+	}
+
+	// Initialize signal handler for graceful CTRL+C handling
+	sigHandler := ui.NewSignalHandler()
+	sigHandler.Start()
+	defer sigHandler.Stop()
 
 	// Warn if Ollama is requested but not available
 	if !inspectNoOllama && !cfg.IsOllamaEnabled() {
@@ -100,9 +111,10 @@ func runInspect(cmd *cobra.Command, args []string) error {
 
 	// Run vulnerability scan if enabled
 	var vulnResults map[string]*vuln.VulnResult
-	var vulnReportPath string
 	if runVulnCheck {
+		logger.Section("Vulnerability Scan")
 		ui.PrintInfo("Scanning for known vulnerabilities...")
+		logger.VulnScan(len(packages))
 		vulnScanner := vuln.NewScanner()
 		packageInfos := make([]vuln.PackageInfo, len(packages))
 		for i, pkg := range packages {
@@ -115,23 +127,11 @@ func runInspect(cmd *cobra.Command, args []string) error {
 		vulnResults, _, err = vulnScanner.QueryPackages(packageInfos)
 		if err != nil {
 			ui.PrintWarning(fmt.Sprintf("Vulnerability scan failed: %v", err))
-		}
-
-		// Generate and save vulnerability report to temp file
-		if len(vulnResults) > 0 {
-			report := vuln.GenerateVulnReport(vulnResults)
-			tmpFile, err := os.CreateTemp("", "bsau-vuln-report-*.txt")
-			if err != nil {
-				ui.PrintWarning(fmt.Sprintf("Failed to create vulnerability report file: %v", err))
-			} else {
-				if _, err := tmpFile.WriteString(report); err != nil {
-					ui.PrintWarning(fmt.Sprintf("Failed to write vulnerability report: %v", err))
-				} else {
-					vulnReportPath = tmpFile.Name()
-				}
-				if err := tmpFile.Close(); err != nil {
-					ui.PrintWarning(fmt.Sprintf("Failed to close vulnerability report file: %v", err))
-				}
+			logger.Error("Vulnerability scan failed: %v", err)
+		} else {
+			// Log results
+			for name, vr := range vulnResults {
+				logger.VulnResult(name, vr.CVECount, string(vr.MaxSeverity))
 			}
 		}
 	}
@@ -146,11 +146,6 @@ func runInspect(cmd *cobra.Command, args []string) error {
 		semgrepRunner, err = semgrep.NewRunner()
 		if err != nil {
 			ui.PrintWarning(fmt.Sprintf("Semgrep not available: %v", err))
-		} else {
-			ui.PrintInfo("Updating Semgrep rules...")
-			if err := semgrepRunner.Update(); err != nil {
-				ui.PrintWarning(fmt.Sprintf("Failed to update Semgrep rules: %v", err))
-			}
 		}
 	}
 
@@ -161,6 +156,7 @@ func runInspect(cmd *cobra.Command, args []string) error {
 		if err := ollamaClient.CheckAvailability(); err != nil {
 			ui.PrintWarning(fmt.Sprintf("Ollama not available: %v", err))
 			ui.PrintWarning("Make sure Ollama is running with: ollama serve")
+			logger.Warn("Ollama not available: %v", err)
 			runOllamaCheck = false
 		}
 	}
@@ -187,7 +183,9 @@ func runInspect(cmd *cobra.Command, args []string) error {
 		}
 
 		// Semgrep scan
+		var semgrepFindings string
 		if semgrepRunner != nil {
+			logger.SemgrepScan(pkg.Name, brewClient.PackagePath(pkg.Name, pkg.Version))
 			semgrepResult, err := semgrepRunner.ScanPackage(
 				brewClient.CellarPath(),
 				pkg.Name,
@@ -195,36 +193,42 @@ func runInspect(cmd *cobra.Command, args []string) error {
 			)
 			if err != nil {
 				ui.PrintWarning(fmt.Sprintf("Semgrep failed for %s: %v", pkg.Name, err))
+				logger.Error("Semgrep failed for %s: %v", pkg.Name, err)
 			} else {
 				row.SemgrepCount = semgrepResult.FindingCount
+				logger.SemgrepResult(pkg.Name, semgrepResult.FindingCount)
 				if semgrepResult.HasFindings && row.Overall == "OK" {
 					row.Overall = "REVIEW"
 				}
+				semgrepFindings = semgrep.FormatFindings(semgrepResult.Findings)
+				// Log individual findings in verbose mode
+				for _, f := range semgrepResult.Findings {
+					logger.SemgrepFinding(f.Path, f.Start.Line, f.CheckID, f.Extra.Severity)
+				}
+			}
+		}
 
-				// Ollama analysis of Semgrep-flagged files
-				if ollamaClient != nil && semgrepResult.HasFindings {
-					flaggedPaths := semgrep.GetFlaggedFilePaths(semgrepResult.Findings)
-					files := make(map[string]string)
-					for _, path := range flaggedPaths {
-						content, err := os.ReadFile(path)
-						if err == nil {
-							files[path] = string(content)
-						}
-					}
-
-					if len(files) > 0 {
-						semgrepFindings := semgrep.FormatFindings(semgrepResult.Findings)
-						codeResult, err := ollamaClient.AnalyzeFiles(pkg.Name, files, semgrepFindings)
-						if err != nil {
-							ui.PrintWarning(fmt.Sprintf("Ollama analysis failed for %s: %v", pkg.Name, err))
-						} else {
-							row.OllamaVerdict = codeResult.Verdict
-							if codeResult.Verdict == ollama.VerdictHold {
-								row.Overall = "HOLD"
-							} else if codeResult.Verdict == ollama.VerdictReview && row.Overall != "MALICIOUS" {
-								row.Overall = "REVIEW"
-							}
-						}
+		// Ollama analysis of ALL text files in the package
+		if ollamaClient != nil {
+			pkgPath := brewClient.PackagePath(pkg.Name, pkg.Version)
+			files, err := snapshot.CollectTextFiles(pkgPath, cfg.OllamaMaxFileBytes)
+			if err != nil {
+				ui.PrintWarning(fmt.Sprintf("Failed to collect files for %s: %v", pkg.Name, err))
+				logger.Error("Failed to collect files for %s: %v", pkg.Name, err)
+			} else if len(files) > 0 {
+				ui.PrintInfo(fmt.Sprintf("Analyzing %d text files for %s...", len(files), pkg.Name))
+				logger.Info("Ollama analyzing %d files for %s", len(files), pkg.Name)
+				codeResult, err := ollamaClient.AnalyzeFiles(pkg.Name, files, semgrepFindings)
+				if err != nil {
+					ui.PrintWarning(fmt.Sprintf("Ollama analysis failed for %s: %v", pkg.Name, err))
+					logger.Error("Ollama analysis failed for %s: %v", pkg.Name, err)
+				} else {
+					row.OllamaVerdict = codeResult.Verdict
+					logger.Result("Ollama", pkg.Name, string(codeResult.Verdict))
+					if codeResult.Verdict == ollama.VerdictHold {
+						row.Overall = "HOLD"
+					} else if codeResult.Verdict == ollama.VerdictReview && row.Overall != "MALICIOUS" {
+						row.Overall = "REVIEW"
 					}
 				}
 			}
@@ -241,10 +245,20 @@ func runInspect(cmd *cobra.Command, args []string) error {
 		ShowOllama:  runOllamaCheck,
 	})
 
-	// Display vulnerability report link if generated
-	if vulnReportPath != "" {
-		fmt.Println()
-		ui.PrintInfo(fmt.Sprintf("Detailed vulnerability report: %s", vulnReportPath))
+	// Display vulnerability details if any found
+	if runVulnCheck && len(vulnResults) > 0 {
+		hasVulns := false
+		for _, vr := range vulnResults {
+			if vr.CVECount > 0 {
+				hasVulns = true
+				break
+			}
+		}
+		if hasVulns {
+			fmt.Println()
+			report := vuln.GenerateVulnReport(vulnResults)
+			fmt.Print(report)
+		}
 	}
 
 	// Summary

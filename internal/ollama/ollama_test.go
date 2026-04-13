@@ -10,8 +10,8 @@ import (
 func TestNewClient(t *testing.T) {
 	client := NewClient("http://localhost:11434", "gemma3", 12000)
 
-	if client.baseURL != "http://localhost:11434/api/generate" {
-		t.Errorf("expected baseURL to include /api/generate, got %s", client.baseURL)
+	if client.baseURL != "http://localhost:11434/api/chat" {
+		t.Errorf("expected baseURL to include /api/chat, got %s", client.baseURL)
 	}
 	if client.model != "gemma3" {
 		t.Errorf("expected model 'gemma3', got %s", client.model)
@@ -24,7 +24,7 @@ func TestNewClient(t *testing.T) {
 func TestNewClient_TrailingSlash(t *testing.T) {
 	client := NewClient("http://localhost:11434/", "llama3", 8000)
 
-	if client.baseURL != "http://localhost:11434/api/generate" {
+	if client.baseURL != "http://localhost:11434/api/chat" {
 		t.Errorf("expected trailing slash to be trimmed, got %s", client.baseURL)
 	}
 }
@@ -188,85 +188,16 @@ func TestAnalyzeFiles_Empty(t *testing.T) {
 	}
 }
 
-func TestBuildFormulaPrompt(t *testing.T) {
-	client := NewClient("http://localhost:11434", "gemma3", 12000)
-
-	versions := []FormulaVersion{
-		{Label: "CURRENT", SHA: "abc123", Content: "class Test < Formula\nend"},
-		{Label: "PREVIOUS", SHA: "def456", Content: "class Test < Formula\nend"},
-	}
-
-	prompt := client.buildFormulaPrompt("test-pkg", versions)
-
-	if prompt == "" {
-		t.Error("expected non-empty prompt")
-	}
-	// Check key elements are in the prompt
-	if !contains(prompt, "test-pkg") {
-		t.Error("expected package name in prompt")
-	}
-	if !contains(prompt, "CURRENT") {
-		t.Error("expected CURRENT label in prompt")
-	}
-	if !contains(prompt, "PREVIOUS") {
-		t.Error("expected PREVIOUS label in prompt")
-	}
-	if !contains(prompt, "VERDICT") {
-		t.Error("expected VERDICT instruction in prompt")
-	}
-}
-
-func TestBuildCodeAnalysisPrompt(t *testing.T) {
-	client := NewClient("http://localhost:11434", "gemma3", 12000)
-
-	prompt := client.buildCodeAnalysisPrompt("test-pkg", "1.0.0", "1.0.1", "+ new line", "")
-
-	if prompt == "" {
-		t.Error("expected non-empty prompt")
-	}
-	if !contains(prompt, "test-pkg") {
-		t.Error("expected package name in prompt")
-	}
-	if !contains(prompt, "1.0.0 → 1.0.1") {
-		t.Error("expected version info in prompt")
-	}
-	if !contains(prompt, "+ new line") {
-		t.Error("expected diff in prompt")
-	}
-}
-
-func TestBuildFileAnalysisPrompt(t *testing.T) {
-	client := NewClient("http://localhost:11434", "gemma3", 12000)
-
-	files := map[string]string{
-		"/path/to/file.py": "import os\nos.system('ls')",
-	}
-
-	prompt := client.buildFileAnalysisPrompt("test-pkg", files, "Semgrep found secrets")
-
-	if prompt == "" {
-		t.Error("expected non-empty prompt")
-	}
-	if !contains(prompt, "test-pkg") {
-		t.Error("expected package name in prompt")
-	}
-	if !contains(prompt, "/path/to/file.py") {
-		t.Error("expected file path in prompt")
-	}
-	if !contains(prompt, "Semgrep found secrets") {
-		t.Error("expected semgrep findings in prompt")
-	}
-}
-
 func TestCheckAvailability_Success(t *testing.T) {
 	// Create a mock server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		response := map[string]interface{}{
-			"model":    "gemma3",
-			"response": "test",
-			"done":     true,
+		response := chatResponse{
+			Model: "gemma3",
+			Done:  true,
 		}
+		response.Message.Role = "assistant"
+		response.Message.Content = "test"
 		if err := json.NewEncoder(w).Encode(response); err != nil {
 			t.Errorf("failed to encode response: %v", err)
 		}
@@ -296,14 +227,15 @@ func TestCheckAvailability_ServerError(t *testing.T) {
 	}
 }
 
-func TestSendRequest_Success(t *testing.T) {
+func TestSendChatRequest_Success(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		response := map[string]interface{}{
-			"model":    "gemma3",
-			"response": "VERDICT: SAFE\nCONFIDENCE: HIGH",
-			"done":     true,
+		response := chatResponse{
+			Model: "gemma3",
+			Done:  true,
 		}
+		response.Message.Role = "assistant"
+		response.Message.Content = "VERDICT: SAFE\nCONFIDENCE: HIGH"
 		if err := json.NewEncoder(w).Encode(response); err != nil {
 			t.Errorf("failed to encode response: %v", err)
 		}
@@ -311,7 +243,7 @@ func TestSendRequest_Success(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "gemma3", 12000)
-	response, err := client.sendRequest("test prompt")
+	response, err := client.sendChatRequest("system prompt", "user prompt")
 
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
@@ -321,14 +253,15 @@ func TestSendRequest_Success(t *testing.T) {
 	}
 }
 
-func TestSendRequest_EmptyResponse(t *testing.T) {
+func TestSendChatRequest_EmptyResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		response := map[string]interface{}{
-			"model":    "gemma3",
-			"response": "",
-			"done":     true,
+		response := chatResponse{
+			Model: "gemma3",
+			Done:  true,
 		}
+		response.Message.Role = "assistant"
+		response.Message.Content = ""
 		if err := json.NewEncoder(w).Encode(response); err != nil {
 			t.Errorf("failed to encode response: %v", err)
 		}
@@ -336,7 +269,7 @@ func TestSendRequest_EmptyResponse(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "gemma3", 12000)
-	_, err := client.sendRequest("test prompt")
+	_, err := client.sendChatRequest("system prompt", "user prompt")
 
 	if err == nil {
 		t.Error("expected error for empty response")
@@ -346,11 +279,12 @@ func TestSendRequest_EmptyResponse(t *testing.T) {
 func TestAnalyzeFormula_WithMockServer(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		response := map[string]interface{}{
-			"model":    "gemma3",
-			"response": "VERDICT: SAFE\nCONFIDENCE: HIGH\nFINDINGS:\n- [No issues found]",
-			"done":     true,
+		response := chatResponse{
+			Model: "gemma3",
+			Done:  true,
 		}
+		response.Message.Role = "assistant"
+		response.Message.Content = "VERDICT: SAFE\nCONFIDENCE: HIGH\nFINDINGS:\n- [No issues found]"
 		if err := json.NewEncoder(w).Encode(response); err != nil {
 			t.Errorf("failed to encode response: %v", err)
 		}
@@ -373,40 +307,48 @@ func TestAnalyzeFormula_WithMockServer(t *testing.T) {
 	}
 }
 
-func TestAnalyzeFormula_Truncation(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		response := map[string]interface{}{
-			"model":    "gemma3",
-			"response": "VERDICT: SAFE\nCONFIDENCE: HIGH",
-			"done":     true,
-		}
-		if err := json.NewEncoder(w).Encode(response); err != nil {
-			t.Errorf("failed to encode response: %v", err)
-		}
-	}))
-	defer server.Close()
+func TestChunkContent(t *testing.T) {
+	// Test small content (under ChunkSize lines)
+	smallContent := "line1\nline2\nline3"
+	chunks := chunkContent(smallContent)
+	if len(chunks) != 1 {
+		t.Errorf("expected 1 chunk for small content, got %d", len(chunks))
+	}
+	if chunks[0] != smallContent {
+		t.Error("expected small content to be returned unchanged")
+	}
 
-	// Create client with small maxFileBytes
-	client := NewClient(server.URL, "gemma3", 100)
-
-	// Create a large formula content
+	// Test large content (over ChunkSize lines)
+	var lines []string
+	for i := 0; i < 100; i++ {
+		lines = append(lines, "line")
+	}
 	largeContent := ""
-	for i := 0; i < 200; i++ {
-		largeContent += "x"
+	for i, line := range lines {
+		if i > 0 {
+			largeContent += "\n"
+		}
+		largeContent += line
 	}
 
-	versions := []FormulaVersion{
-		{Label: "CURRENT", Content: largeContent},
+	chunks = chunkContent(largeContent)
+	if len(chunks) < 2 {
+		t.Errorf("expected multiple chunks for large content, got %d", len(chunks))
 	}
+}
 
-	result, err := client.AnalyzeFormula("test-pkg", versions)
-
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
+func TestVerdictPriority(t *testing.T) {
+	if verdictPriority(VerdictSafe) != 1 {
+		t.Error("SAFE should have priority 1")
 	}
-	if !result.Truncated {
-		t.Error("expected truncation flag to be set")
+	if verdictPriority(VerdictReview) != 2 {
+		t.Error("REVIEW should have priority 2")
+	}
+	if verdictPriority(VerdictHold) != 3 {
+		t.Error("HOLD should have priority 3")
+	}
+	if verdictPriority("UNKNOWN") != 0 {
+		t.Error("Unknown verdict should have priority 0")
 	}
 }
 
@@ -434,16 +376,24 @@ func TestConfidenceConstants(t *testing.T) {
 	}
 }
 
-// Helper function
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsSubstring(s, substr))
-}
-
-func containsSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
+func TestPromptConstants(t *testing.T) {
+	// Verify prompts are defined and non-empty
+	if SystemPrompt == "" {
+		t.Error("SystemPrompt should not be empty")
 	}
-	return false
+	if UserPromptFileAnalysis == "" {
+		t.Error("UserPromptFileAnalysis should not be empty")
+	}
+	if UserPromptFormulaAnalysis == "" {
+		t.Error("UserPromptFormulaAnalysis should not be empty")
+	}
+	if UserPromptDiffAnalysis == "" {
+		t.Error("UserPromptDiffAnalysis should not be empty")
+	}
+	if ChunkSize <= 0 {
+		t.Error("ChunkSize should be positive")
+	}
+	if ChunkOverlap < 0 {
+		t.Error("ChunkOverlap should not be negative")
+	}
 }

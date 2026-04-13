@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/sud0x0/bsau/internal/brew"
+	"github.com/sud0x0/bsau/internal/logger"
 	"github.com/sud0x0/bsau/internal/ollama"
 	"github.com/sud0x0/bsau/internal/semgrep"
 	"github.com/sud0x0/bsau/internal/snapshot"
@@ -14,8 +15,9 @@ import (
 )
 
 var (
-	noOllama bool
-	dryRun   bool
+	noOllama  bool
+	noSemgrep bool
+	dryRun    bool
 )
 
 var runCmd = &cobra.Command{
@@ -25,23 +27,28 @@ var runCmd = &cobra.Command{
 
 1. Identify and audit current state (packages, CVEs)
 2. Identify what needs to be updated
-3. Pre-install security scan (Ollama formula analysis)
+3. Pre-install security scan (local LLM formula analysis)
 4. Per-package approval gate
 5. Upgrade approved packages (with pre-upgrade snapshot)
-6. Post-install verification (Semgrep, Ollama code analysis)
+6. Post-install verification (Semgrep, local LLM code analysis)
 7. Cleanup`,
 	RunE: runWorkflow,
 }
 
 func init() {
-	runCmd.Flags().BoolVar(&noOllama, "no-ollama", false, "skip Ollama analysis for this run")
+	runCmd.Flags().BoolVar(&noOllama, "no-ollama", false, "skip local LLM analysis for this run")
+	runCmd.Flags().BoolVar(&noSemgrep, "no-semgrep", false, "skip Semgrep scan for this run")
 	runCmd.Flags().BoolVar(&dryRun, "dry-run", false, "run scans but do not upgrade")
 }
 
 func runWorkflow(cmd *cobra.Command, args []string) error {
 	// Apply CLI overrides
 	cfg.NoOllama = noOllama
+	cfg.NoSemgrep = noSemgrep
 	cfg.DryRun = dryRun
+
+	// Close logger at the end
+	defer logger.Close()
 
 	// Initialize run manager (creates /tmp/bsau-<run-id>/)
 	runMgr, err := state.NewRunManager()
@@ -49,6 +56,7 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("initializing run manager: %w", err)
 	}
 	defer func() { _ = runMgr.Cleanup() }()
+	logger.Info("Run directory: %s", runMgr.RunDir())
 
 	// Initialize signal handler for graceful CTRL+C handling
 	sigHandler := ui.NewSignalHandler()
@@ -69,7 +77,7 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 
 	// === Step 1: Identify and audit current state ===
 	ui.PrintStep(1, 7, "Identify and Audit Current State",
-		"Scanning Homebrew packages, checking for outdated versions, and querying OSV for vulnerabilities.")
+		"Scanning Homebrew packages, checking for outdated versions, and querying OSV/NIST NVD for vulnerabilities.")
 
 	outdated, err := brewClient.GetOutdated()
 	if err != nil {
@@ -143,19 +151,9 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 		ui.PrintWarning(fmt.Sprintf("Failed to save pre-update vuln state: %v", err))
 	}
 
-	// Generate detailed vulnerability report
-	vulnReport := vuln.GenerateVulnReport(vulnResults)
-	if err := runMgr.SaveVulnReport(vulnReport); err != nil {
-		ui.PrintWarning(fmt.Sprintf("Failed to save vulnerability report: %v", err))
-	}
-
 	// === Step 2: Identify what needs to be updated ===
 	ui.PrintStep(2, 7, "Identify What Needs to Be Updated",
 		"Displaying outdated packages with vulnerability info. Select which packages to update.")
-
-	// Display link to detailed vulnerability report
-	ui.PrintInfo(fmt.Sprintf("Detailed vulnerability report: %s", runMgr.VulnReportPath()))
-	ui.PrintInfo("(Note: This file will be deleted when bsau exits)")
 
 	// Warn about skipped packages (no GitHub URL or unsupported registry)
 	if vulnStats != nil && vulnStats.PackagesSkipped > 0 {
@@ -474,28 +472,43 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 
 	// === Step 6: Post-install verification ===
 	ui.PrintStep(6, 7, "Post-Install Verification",
-		"Verifying upgraded packages with Semgrep scan and Ollama code analysis.")
+		"Verifying upgraded packages with Semgrep scan and local LLM code analysis.")
+
+	// Track scan status for final report
+	var semgrepStatus, ollamaStatus string
 
 	// Show scan status
 	fmt.Println("Scan status:")
 
 	// Initialize Semgrep
 	var semgrepRunner *semgrep.Runner
-	semgrepRunner, err = semgrep.NewRunner()
-	if err != nil {
-		ui.PrintSkipped(fmt.Sprintf("Semgrep scan: not available (%v)", err))
+	if cfg.NoSemgrep {
+		ui.PrintSkipped("Semgrep scan: skipped (--no-semgrep)")
+		semgrepStatus = "skipped (--no-semgrep)"
 	} else {
-		ui.PrintInfo("Semgrep scan: enabled")
-		if err := semgrepRunner.Update(); err != nil {
-			ui.PrintWarning(fmt.Sprintf("Failed to update Semgrep rules: %v", err))
+		semgrepRunner, err = semgrep.NewRunner()
+		if err != nil {
+			ui.PrintSkipped(fmt.Sprintf("Semgrep scan: not available (%v)", err))
+			semgrepStatus = fmt.Sprintf("not run (not available: %v)", err)
+		} else {
+			ui.PrintInfo("Semgrep scan: enabled")
+			semgrepStatus = "completed"
 		}
 	}
 
 	// Ollama code analysis status
 	if cfg.IsOllamaEnabled() && ollamaClient != nil {
-		ui.PrintInfo("Ollama code analysis: enabled")
+		ui.PrintInfo("Local LLM code analysis: enabled")
+		ollamaStatus = "completed"
+	} else if cfg.NoOllama {
+		ui.PrintSkipped("Local LLM code analysis: skipped (--no-ollama)")
+		ollamaStatus = "skipped (--no-ollama)"
+	} else if !cfg.Features.OllamaScan {
+		ui.PrintSkipped("Local LLM code analysis: disabled in config")
+		ollamaStatus = "disabled in config"
 	} else {
-		ui.PrintSkipped("Ollama code analysis: disabled (enable with 'ollama_scan: true' in settings.yaml)")
+		ui.PrintSkipped("Local LLM code analysis: not available (Ollama not running)")
+		ollamaStatus = "not run (Ollama not running)"
 	}
 	fmt.Println()
 
@@ -673,6 +686,27 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 		ui.PrintWarning(fmt.Sprintf("Brew cleanup failed: %v", err))
 	} else {
 		ui.PrintSuccess("Brew cleanup complete")
+	}
+
+	// Final scan status summary
+	fmt.Println()
+	fmt.Println("=== Scan Summary ===")
+	fmt.Printf("Vulnerability scan: completed\n")
+	fmt.Printf("Semgrep scan: %s\n", semgrepStatus)
+	fmt.Printf("Local LLM analysis: %s\n", ollamaStatus)
+
+	// Display vulnerability report
+	hasVulns := false
+	for _, vr := range vulnResults {
+		if vr.CVECount > 0 {
+			hasVulns = true
+			break
+		}
+	}
+	if hasVulns {
+		fmt.Println()
+		vulnReport := vuln.GenerateVulnReport(vulnResults)
+		fmt.Print(vulnReport)
 	}
 
 	fmt.Println()

@@ -101,7 +101,7 @@ func (m *Manager) estimateTextFileSize(srcPath string) (int64, error) {
 			return nil
 		}
 
-		if isTextFile(path) {
+		if IsTextFile(path) {
 			totalSize += info.Size()
 		}
 		return nil
@@ -139,7 +139,7 @@ func (m *Manager) CreateSnapshot(srcPath, pkg, version string) (string, error) {
 		}
 
 		// Only copy text-readable files
-		if !isTextFile(path) {
+		if !IsTextFile(path) {
 			return nil
 		}
 
@@ -181,8 +181,8 @@ func (m *Manager) Cleanup(pkg string) error {
 	return os.RemoveAll(pkgDir)
 }
 
-// isTextFile checks if a file is text-readable (valid UTF-8)
-func isTextFile(path string) bool {
+// IsTextFile checks if a file is text-readable (valid UTF-8)
+func IsTextFile(path string) bool {
 	// Check extension first for common cases
 	ext := strings.ToLower(filepath.Ext(path))
 	textExtensions := map[string]bool{
@@ -232,6 +232,43 @@ func isTextFile(path string) bool {
 	}
 
 	return true
+}
+
+// CollectTextFiles returns a map of file paths to their contents for all text files in a directory
+func CollectTextFiles(dirPath string, maxFileBytes int) (map[string]string, error) {
+	files := make(map[string]string)
+
+	err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip inaccessible files
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+
+		// Skip files larger than maxFileBytes
+		if maxFileBytes > 0 && info.Size() > int64(maxFileBytes) {
+			return nil
+		}
+
+		if IsTextFile(path) {
+			content, err := os.ReadFile(path)
+			if err != nil {
+				return nil // Skip unreadable files
+			}
+			files[path] = string(content)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("walking directory: %w", err)
+	}
+
+	return files, nil
 }
 
 func copyFile(src, dst string) error {

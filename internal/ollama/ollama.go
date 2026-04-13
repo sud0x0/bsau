@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/sud0x0/bsau/internal/logger"
 )
 
 // Client handles Ollama API interactions
@@ -75,20 +77,33 @@ type FormulaVersion struct {
 	Content string
 }
 
-// UsageEstimate contains estimated API usage for a step
-// Simplified for Ollama since it's local and has no rate limits
-type UsageEstimate struct {
-	OllamaPackages []string // Packages that will use Ollama
-	VTRequests     int      // Total VT API requests needed
-	VTHashes       int      // Total hashes flagged by CIRCL as malicious
-	CIRCLMalicious []string // File paths flagged as malicious by CIRCL
+// chatMessage represents a message in the chat API
+type chatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// chatRequest represents a request to the chat API
+type chatRequest struct {
+	Model    string        `json:"model"`
+	Messages []chatMessage `json:"messages"`
+	Stream   bool          `json:"stream"`
+}
+
+// chatResponse represents a response from the chat API
+type chatResponse struct {
+	Model   string `json:"model"`
+	Message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	} `json:"message"`
+	Done bool `json:"done"`
 }
 
 // NewClient creates a new Ollama API client
-// baseURL should be the Ollama server URL from settings (e.g., http://localhost:11434)
 func NewClient(baseURL, model string, maxFileBytes int) *Client {
-	// Ensure the URL includes the API path
-	apiURL := strings.TrimSuffix(baseURL, "/") + "/api/generate"
+	// Use the chat API endpoint
+	apiURL := strings.TrimSuffix(baseURL, "/") + "/api/chat"
 
 	return &Client{
 		baseURL:      apiURL,
@@ -102,22 +117,34 @@ func NewClient(baseURL, model string, maxFileBytes int) *Client {
 
 // CheckAvailability verifies that Ollama is running and the model is available
 func (c *Client) CheckAvailability() error {
-	// Try a simple request to check if Ollama is running
-	req, err := http.NewRequest(http.MethodPost, c.baseURL, bytes.NewReader([]byte(`{"model":"`+c.model+`","prompt":"test","stream":false}`)))
+	req := chatRequest{
+		Model: c.model,
+		Messages: []chatMessage{
+			{Role: "user", Content: "test"},
+		},
+		Stream: false,
+	}
+
+	body, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("creating request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	httpReq, err := http.NewRequest(http.MethodPost, c.baseURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("ollama not reachable at %s: %w", c.baseURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("ollama error (%d): %s", resp.StatusCode, string(body))
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("ollama error (%d): %s", resp.StatusCode, string(respBody))
 	}
 
 	return nil
@@ -132,16 +159,26 @@ func (c *Client) AnalyzeFormula(pkg string, versions []FormulaVersion) (*Formula
 		return result, nil
 	}
 
-	prompt := c.buildFormulaPrompt(pkg, versions)
-	if len(prompt) > c.maxFileBytes {
-		prompt = prompt[:c.maxFileBytes]
-		result.Truncated = true
+	// Build the content with all formula versions
+	var content strings.Builder
+	fmt.Fprintf(&content, "Package: %s\n\n", pkg)
+
+	for _, v := range versions {
+		fmt.Fprintf(&content, "=== %s ===\n", v.Label)
+		if v.SHA != "" {
+			fmt.Fprintf(&content, "Git SHA: %s\n", v.SHA)
+		}
+		content.WriteString("```ruby\n")
+		content.WriteString(v.Content)
+		content.WriteString("\n```\n\n")
 	}
 
-	response, err := c.sendRequest(prompt)
+	userPrompt := UserPromptFormulaAnalysis + "\n\n" + content.String()
+
+	response, err := c.sendChatRequest(SystemPrompt, userPrompt)
 	if err != nil {
 		result.Error = err
-		result.Verdict = VerdictReview // Fail-safe: mark as REVIEW on error
+		result.Verdict = VerdictReview
 		return result, nil
 	}
 
@@ -160,14 +197,29 @@ func (c *Client) AnalyzeCode(pkg, oldVersion, newVersion, diff, semgrepFindings 
 	}
 
 	if diff == "" {
-		// No text files changed - skip analysis
 		result.Verdict = VerdictSafe
 		return result, nil
 	}
 
-	prompt := c.buildCodeAnalysisPrompt(pkg, oldVersion, newVersion, diff, semgrepFindings)
+	// Build user content
+	var content strings.Builder
+	fmt.Fprintf(&content, "Package: %s\n", pkg)
+	fmt.Fprintf(&content, "Upgraded: %s → %s\n", oldVersion, newVersion)
+	fmt.Fprintf(&content, "Installed path: /opt/homebrew/Cellar/%s/%s/\n\n", pkg, newVersion)
 
-	response, err := c.sendRequest(prompt)
+	if semgrepFindings != "" && semgrepFindings != "None" {
+		content.WriteString("Semgrep findings:\n")
+		content.WriteString(semgrepFindings)
+		content.WriteString("\n\n")
+	}
+
+	content.WriteString("Diff:\n```diff\n")
+	content.WriteString(diff)
+	content.WriteString("\n```")
+
+	userPrompt := UserPromptDiffAnalysis + "\n\n" + content.String()
+
+	response, err := c.sendChatRequest(SystemPrompt, userPrompt)
 	if err != nil {
 		result.Error = err
 		result.Verdict = VerdictReview
@@ -180,7 +232,8 @@ func (c *Client) AnalyzeCode(pkg, oldVersion, newVersion, diff, semgrepFindings 
 	return result, nil
 }
 
-// AnalyzeFiles analyzes raw file contents for inspect command (no diff available)
+// AnalyzeFiles analyzes file contents using chunking (for inspect command)
+// This scans all provided files in chunks, similar to the test script
 func (c *Client) AnalyzeFiles(pkg string, files map[string]string, semgrepFindings string) (*CodeAnalysisResult, error) {
 	result := &CodeAnalysisResult{Package: pkg}
 
@@ -189,195 +242,164 @@ func (c *Client) AnalyzeFiles(pkg string, files map[string]string, semgrepFindin
 		return result, nil
 	}
 
-	prompt := c.buildFileAnalysisPrompt(pkg, files, semgrepFindings)
+	// Collect all chunk results
+	var allFindings []Finding
+	worstVerdict := VerdictSafe
+	var allResponses strings.Builder
 
-	response, err := c.sendRequest(prompt)
-	if err != nil {
-		result.Error = err
-		result.Verdict = VerdictReview
-		return result, nil
+	// Process each file
+	for filePath, content := range files {
+		chunks := chunkContent(content)
+
+		for i, chunk := range chunks {
+			startLine := i*(ChunkSize-ChunkOverlap) + 1
+			endLine := startLine + len(strings.Split(chunk, "\n")) - 1
+
+			// Build user content for this chunk
+			var userContent strings.Builder
+			fmt.Fprintf(&userContent, "Package: %s\n", pkg)
+
+			if semgrepFindings != "" {
+				userContent.WriteString("Semgrep findings:\n")
+				userContent.WriteString(semgrepFindings)
+				userContent.WriteString("\n\n")
+			}
+
+			fmt.Fprintf(&userContent, "File: %s (lines %d-%d):\n```\n%s\n```",
+				filePath, startLine, endLine, chunk)
+
+			userPrompt := UserPromptFileAnalysis + "\n\n" + userContent.String()
+
+			response, err := c.sendChatRequest(SystemPrompt, userPrompt)
+			if err != nil {
+				// Continue with other chunks on error
+				continue
+			}
+
+			fmt.Fprintf(&allResponses, "--- %s (lines %d-%d) ---\n", filePath, startLine, endLine)
+			allResponses.WriteString(response)
+			allResponses.WriteString("\n\n")
+
+			// Parse this chunk's response
+			chunkResult := &CodeAnalysisResult{}
+			c.parseCodeResponse(response, chunkResult)
+
+			// Aggregate results
+			allFindings = append(allFindings, chunkResult.Findings...)
+
+			// Keep worst verdict
+			if verdictPriority(chunkResult.Verdict) > verdictPriority(worstVerdict) {
+				worstVerdict = chunkResult.Verdict
+			}
+		}
 	}
 
-	result.RawResponse = response
-	c.parseCodeResponse(response, result)
+	result.Verdict = worstVerdict
+	result.Findings = allFindings
+	result.RawResponse = allResponses.String()
 
 	return result, nil
 }
 
-func (c *Client) buildFormulaPrompt(pkg string, versions []FormulaVersion) string {
-	var sb strings.Builder
+// chunkContent splits content into chunks of ChunkSize lines with ChunkOverlap overlap
+func chunkContent(content string) []string {
+	lines := strings.Split(content, "\n")
+	totalLines := len(lines)
 
-	sb.WriteString(`You are performing a pre-install security audit of a Homebrew formula.
-Analyze the formula versions below with particular focus on what changed between them.
-Any pattern present in CURRENT but absent from prior versions is higher suspicion.
+	if totalLines <= ChunkSize {
+		return []string{content}
+	}
 
-Package: `)
-	sb.WriteString(pkg)
-	sb.WriteString("\n\n")
+	var chunks []string
+	start := 0
 
-	for _, v := range versions {
-		fmt.Fprintf(&sb, "=== %s ===\n", v.Label)
-		if v.SHA != "" {
-			fmt.Fprintf(&sb, "Git SHA: %s\n", v.SHA)
+	for start < totalLines {
+		end := start + ChunkSize
+		if end > totalLines {
+			end = totalLines
 		}
-		sb.WriteString("```ruby\n")
-		sb.WriteString(v.Content)
-		sb.WriteString("\n```\n\n")
+
+		chunk := strings.Join(lines[start:end], "\n")
+		chunks = append(chunks, chunk)
+
+		if end >= totalLines {
+			break
+		}
+
+		start = end - ChunkOverlap
 	}
 
-	sb.WriteString(`Look for:
-- New or changed download URLs pointing to unexpected or non-canonical domains
-- Newly added or modified shell hooks (postinstall, preinstall, caveats)
-- Obfuscated shell commands or base64+eval patterns
-- curl | bash or wget | sh without checksum verification
-- Credential harvesting from environment variables
-- Persistence mechanisms (LaunchAgent/LaunchDaemon writes)
-- Exfiltration endpoints (hardcoded IPs, unusual domains)
-
-Respond with EXACTLY this format:
-VERDICT: SAFE | REVIEW | HOLD
-CONFIDENCE: HIGH | MEDIUM | LOW
-FINDINGS:
-- [version label, line number, what changed, why suspicious]
-`)
-
-	return sb.String()
+	return chunks
 }
 
-func (c *Client) buildCodeAnalysisPrompt(pkg, oldVersion, newVersion, diff, semgrepFindings string) string {
-	var sb strings.Builder
-
-	sb.WriteString(`You are performing a post-install security audit of a Homebrew package
-that has just been upgraded on a macOS developer machine.
-
-Package: `)
-	sb.WriteString(pkg)
-	fmt.Fprintf(&sb, "\nUpgraded: %s → %s\n", oldVersion, newVersion)
-	fmt.Fprintf(&sb, "Installed path: /opt/homebrew/Cellar/%s/%s/\n\n", pkg, newVersion)
-
-	sb.WriteString("Semgrep findings (malicious code rule sets only):\n")
-	if semgrepFindings == "" || semgrepFindings == "None" {
-		sb.WriteString("None\n\n")
-	} else {
-		sb.WriteString(semgrepFindings)
-		sb.WriteString("\n\n")
+func verdictPriority(v Verdict) int {
+	switch v {
+	case VerdictHold:
+		return 3
+	case VerdictReview:
+		return 2
+	case VerdictSafe:
+		return 1
+	default:
+		return 0
 	}
-
-	sb.WriteString("Unified diff of changed files (text-readable files only):\n")
-	sb.WriteString("```diff\n")
-	sb.WriteString(diff)
-	sb.WriteString("\n```\n\n")
-
-	sb.WriteString(`Analyse the diff for malicious patterns introduced in this version.
-Focus on what is NEW or CHANGED — patterns present in the old version
-that remain unchanged are lower priority than newly introduced patterns.
-
-Look for:
-- Exfiltration of credentials, environment variables, or files to remote endpoints
-- Encoded or obfuscated payloads being decoded and executed
-- Unexpected network calls (curl, wget, requests, http) in non-networking code
-- Persistence mechanisms (LaunchAgent/LaunchDaemon, cron, startup items)
-- Privilege escalation or unexpected sudo usage
-- Reverse shell or command-and-control patterns
-- Anything Semgrep flagged — reason about whether it is a genuine threat
-  or a false positive, with explanation
-
-Respond with EXACTLY this format:
-VERDICT: SAFE | REVIEW | HOLD
-CONFIDENCE: HIGH | MEDIUM | LOW
-FINDINGS:
-- [file path, line number, what changed, why it is suspicious]
-`)
-
-	return sb.String()
 }
 
-func (c *Client) buildFileAnalysisPrompt(pkg string, files map[string]string, semgrepFindings string) string {
-	var sb strings.Builder
-
-	sb.WriteString(`You are performing a security audit of installed files from a Homebrew package.
-This is a standalone inspection (not an upgrade diff).
-
-Package: `)
-	sb.WriteString(pkg)
-	sb.WriteString("\n\n")
-
-	sb.WriteString("Semgrep findings (malicious code rule sets only):\n")
-	if semgrepFindings == "" {
-		sb.WriteString("None\n\n")
-	} else {
-		sb.WriteString(semgrepFindings)
-		sb.WriteString("\n\n")
+func (c *Client) sendChatRequest(systemPrompt, userPrompt string) (string, error) {
+	req := chatRequest{
+		Model: c.model,
+		Messages: []chatMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+		Stream: false,
 	}
 
-	sb.WriteString("Files flagged by Semgrep:\n")
-	for path, content := range files {
-		fmt.Fprintf(&sb, "\n=== %s ===\n```\n%s\n```\n", path, content)
-	}
+	// Log request
+	logger.OllamaRequest(c.model, systemPrompt, userPrompt)
 
-	sb.WriteString(`
-Analyze these files for malicious patterns:
-- Exfiltration of credentials or files to remote endpoints
-- Encoded or obfuscated payloads
-- Unexpected network calls
-- Persistence mechanisms
-- Privilege escalation
-- Reverse shell patterns
-
-Respond with EXACTLY this format:
-VERDICT: SAFE | REVIEW | HOLD
-CONFIDENCE: HIGH | MEDIUM | LOW
-FINDINGS:
-- [file path, line number, what is suspicious, why]
-`)
-
-	return sb.String()
-}
-
-func (c *Client) sendRequest(prompt string) (string, error) {
-	requestBody := map[string]interface{}{
-		"model":  c.model,
-		"prompt": prompt,
-		"stream": false,
-	}
-
-	body, err := json.Marshal(requestBody)
+	body, err := json.Marshal(req)
 	if err != nil {
 		return "", fmt.Errorf("marshaling request: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, c.baseURL, bytes.NewReader(body))
+	httpReq, err := http.NewRequest(http.MethodPost, c.baseURL, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("creating request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	startTime := time.Now()
+
+	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
+		logger.OllamaError(err)
 		return "", fmt.Errorf("ollama request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	elapsed := time.Since(startTime)
+
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(resp.Body)
+		logger.OllamaError(fmt.Errorf("status %d: %s", resp.StatusCode, string(errBody)))
 		return "", fmt.Errorf("ollama error (%d): %s", resp.StatusCode, string(errBody))
 	}
 
-	var response struct {
-		Model    string `json:"model"`
-		Response string `json:"response"`
-		Done     bool   `json:"done"`
-	}
-
+	var response chatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		return "", fmt.Errorf("decoding response: %w", err)
 	}
 
-	if response.Response == "" {
+	if response.Message.Content == "" {
+		logger.OllamaError(fmt.Errorf("empty response"))
 		return "", fmt.Errorf("empty response from ollama")
 	}
 
-	return response.Response, nil
+	// Log response
+	logger.OllamaResponse(elapsed, response.Message.Content)
+
+	return response.Message.Content, nil
 }
 
 func (c *Client) parseResponse(response string, result *FormulaAnalysisResult) {
@@ -386,7 +408,7 @@ func (c *Client) parseResponse(response string, result *FormulaAnalysisResult) {
 	if match := verdictRegex.FindStringSubmatch(response); len(match) > 1 {
 		result.Verdict = Verdict(match[1])
 	} else {
-		result.Verdict = VerdictReview // Default to REVIEW if not parseable
+		result.Verdict = VerdictReview
 	}
 
 	// Parse CONFIDENCE
@@ -397,7 +419,7 @@ func (c *Client) parseResponse(response string, result *FormulaAnalysisResult) {
 		result.Confidence = ConfidenceMedium
 	}
 
-	// Parse FINDINGS (simplified)
+	// Parse FINDINGS
 	findingsRegex := regexp.MustCompile(`(?m)^-\s*\[([^\]]+)\]`)
 	matches := findingsRegex.FindAllStringSubmatch(response, -1)
 	for _, match := range matches {

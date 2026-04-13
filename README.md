@@ -73,13 +73,13 @@ bsau performs multiple layers of security analysis before and after every upgrad
 **Required:**
 - macOS (Apple Silicon or Intel)
 - [Homebrew](https://brew.sh/) installed
+- [Semgrep](https://semgrep.dev/docs/getting-started/quickstart) - for static analysis scans
 
 **Optional (for full functionality):**
 
 - [Ollama](https://ollama.ai/) - for local LLM formula/code analysis (no API key needed)
-- [Semgrep](https://semgrep.dev/docs/getting-started/quickstart) - for static analysis scans
 
-> **Note:** bsau works without optional dependencies. OSV vulnerability scanning requires no API keys and is always active. Ollama runs locally so no API key is required - just install and run `ollama serve`.
+> **Note:** OSV/NIST NVD vulnerability scanning and Semgrep require no API keys and are always active. Ollama is optional and runs locally - just install and run `ollama serve`.
 
 ## Option 1: Download from Releases
 
@@ -137,6 +137,7 @@ bsau run --dry-run
 |---------|-------------|
 | `bsau run` | Full scan and update workflow |
 | `bsau run --dry-run` | Run scans, show results, skip upgrades |
+| `bsau run --no-semgrep` | Skip Semgrep scan for this run |
 | `bsau run --no-ollama` | Skip local LLM analysis for this run |
 | `bsau inspect` | Show inspect help menu |
 | `bsau inspect <package>` | Scan a specific package |
@@ -166,8 +167,10 @@ This creates `settings.yaml` next to the binary (e.g., `/usr/local/bin/settings.
 features:
   ollama_scan: true
 
-# LLM model to use (Ollama model name)
-ollama_model: gemma3
+# LLM model to use (REQUIRED when ollama_scan is enabled)
+# Run 'ollama list' to see available models
+# No default - you must specify a model
+ollama_model: gemma3  # or llama3, mistral, etc.
 ```
 
 Make sure Ollama is running if `ollama_scan` is enabled:
@@ -224,8 +227,7 @@ ollama serve   # Start Ollama server
 ## Step 6: Post-install Verification
 
 **6a. Semgrep Scan**
-- Updates Semgrep rules before scanning
-- Runs with `p/supply-chain`, `p/secrets`, `p/malicious-code` rule sets
+- Runs with `p/supply-chain`, `p/secrets`, `p/malicious-code` rule sets (auto-downloaded)
 - Parses JSON output for flagged files and line numbers
 
 **6b. Diff Generation**
@@ -258,7 +260,7 @@ ollama serve   # Start Ollama server
 - [pre-commit](https://pre-commit.com/)
 - [golangci-lint](https://golangci-lint.run/)
 - [govulncheck](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck)
-- [Semgrep](https://semgrep.dev/) (optional, for security scans)
+- [Semgrep](https://semgrep.dev/) (for security scans)
 
 ## Setup Steps
 
@@ -284,7 +286,7 @@ ollama serve   # Start Ollama server
    # Install pre-commit
    brew install pre-commit
 
-   # Install semgrep (optional)
+   # Install semgrep
    brew install semgrep
    ```
 
@@ -335,4 +337,7 @@ ollama serve
 
 # TODO
 
-- Use macOS Keychain for API key storage instead of environment variables
+- Tap verification
+- Binary signing verification
+- Transitive dependency scanning
+- Network monitoring during install

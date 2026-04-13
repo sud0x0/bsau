@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/sud0x0/bsau/internal/config"
+	"github.com/sud0x0/bsau/internal/logger"
 	"github.com/sud0x0/bsau/internal/ui"
 )
 
@@ -14,7 +15,7 @@ var (
 	cfgFile string
 	verbose bool
 	cfg     *config.Config
-	logger  *slog.Logger
+	slogger *slog.Logger
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -62,14 +63,28 @@ Commands:
 		// Apply CLI flag overrides
 		cfg.Verbose = verbose
 
-		// Setup logger
+		// Setup slog logger
 		logLevel := slog.LevelInfo
 		if verbose {
 			logLevel = slog.LevelDebug
 		}
-		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		slogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 			Level: logLevel,
 		}))
+
+		// Initialize file logger
+		binDir, err := config.GetBinaryDir()
+		if err == nil {
+			if initErr := logger.Init(binDir, verbose); initErr != nil {
+				// Non-fatal: just warn if we can't create log file
+				ui.PrintWarning(fmt.Sprintf("Could not create log file: %v", initErr))
+			} else {
+				logger.Info("Command: bsau %s", cmd.Name())
+				if verbose {
+					ui.PrintInfo(fmt.Sprintf("Log file: %s", logger.GetLogPath()))
+				}
+			}
+		}
 
 		// Validate configuration
 		if err := cfg.Validate(); err != nil {
@@ -101,7 +116,7 @@ func GetConfig() *config.Config {
 	return cfg
 }
 
-// GetLogger returns the configured logger
+// GetLogger returns the configured slog logger
 func GetLogger() *slog.Logger {
-	return logger
+	return slogger
 }

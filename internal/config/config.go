@@ -25,9 +25,10 @@ type Config struct {
 	OllamaMaxFileBytes int    `mapstructure:"ollama_max_file_bytes"`
 
 	// Runtime overrides (set via CLI flags)
-	NoOllama bool `mapstructure:"-"`
-	DryRun   bool `mapstructure:"-"`
-	Verbose  bool `mapstructure:"-"`
+	NoOllama  bool `mapstructure:"-"`
+	NoSemgrep bool `mapstructure:"-"`
+	DryRun    bool `mapstructure:"-"`
+	Verbose   bool `mapstructure:"-"`
 }
 
 type FeaturesConfig struct {
@@ -72,7 +73,7 @@ func Load() (*Config, error) {
 	v.SetDefault("block_policy.ollama_formula_hold", true)
 	v.SetDefault("block_policy.ollama_code_hold", true)
 	v.SetDefault("ollama_url", "http://localhost:11434")
-	v.SetDefault("ollama_model", "gemma3")
+	v.SetDefault("ollama_model", "") // Must be set in settings.yaml when ollama_scan is enabled
 	v.SetDefault("ollama_max_file_bytes", 12000)
 
 	// Check for config override via env
@@ -110,8 +111,10 @@ func Load() (*Config, error) {
 
 // Validate checks configuration validity
 func (c *Config) Validate() error {
-	// Ollama runs locally, no API key needed
-	// Validation happens at runtime when the client is created
+	// If Ollama is enabled, model must be set
+	if c.Features.OllamaScan && c.OllamaModel == "" {
+		return fmt.Errorf("ollama_model must be set in settings.yaml when features.ollama_scan is enabled")
+	}
 	return nil
 }
 
@@ -135,24 +138,25 @@ homebrew_path: /opt/homebrew
 
 # Feature flags - enable optional scanning features
 features:
-  # Enable Ollama LLM analysis (requires Ollama running locally)
-  # Install: brew install ollama && ollama pull gemma3
+  # Enable local LLM analysis (requires Ollama running locally)
+  # Install: brew install ollama && ollama pull <model>
   ollama_scan: false
 
 # Ollama server URL (default: http://localhost:11434)
 ollama_url: http://localhost:11434
 
-# Ollama model to use for analysis (default: gemma3)
-# Other options: llama3, mistral, codellama, etc.
-ollama_model: gemma3
+# LLM model to use for analysis (required when ollama_scan is enabled)
+# Examples: gemma3, llama3, mistral, codellama, etc.
+# Run 'ollama list' to see available models
+ollama_model: ""
 
-# Maximum formula file size in bytes sent to Ollama
+# Maximum formula file size in bytes sent to LLM
 ollama_max_file_bytes: 12000
 
 # Blocking policy - which signals block an upgrade
 block_policy:
-  ollama_formula_hold: true   # Block if Ollama formula analysis returns HOLD
-  ollama_code_hold: true      # Block if Ollama code analysis returns HOLD
+  ollama_formula_hold: true   # Block if LLM formula analysis returns HOLD
+  ollama_code_hold: true      # Block if LLM code analysis returns HOLD
 `
 
 // GenerateConfigFile creates a default config file in the binary directory

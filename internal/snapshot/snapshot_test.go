@@ -72,9 +72,9 @@ func TestIsTextFile(t *testing.T) {
 				t.Fatalf("failed to write test file: %v", err)
 			}
 
-			result := isTextFile(filePath)
+			result := IsTextFile(filePath)
 			if result != tt.expected {
-				t.Errorf("isTextFile(%s) = %v, expected %v", tt.filename, result, tt.expected)
+				t.Errorf("IsTextFile(%s) = %v, expected %v", tt.filename, result, tt.expected)
 			}
 		})
 	}

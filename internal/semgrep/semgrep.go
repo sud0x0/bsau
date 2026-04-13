@@ -70,17 +70,11 @@ func NewRunner() (*Runner, error) {
 	}, nil
 }
 
-// Update updates Semgrep rules before scanning
+// Update is a no-op - Semgrep auto-downloads rules when using remote configs
+// The --update flag was deprecated in newer Semgrep versions
 func (r *Runner) Update() error {
-	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
-	cmd := exec.Command(r.semgrepPath, "--update")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("updating semgrep rules: %w", err)
-	}
-
+	// Rules are automatically downloaded when scanning with remote configs
+	// like p/supply-chain, p/secrets, p/malicious-code
 	return nil
 }
 
