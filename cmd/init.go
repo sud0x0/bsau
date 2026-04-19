@@ -42,7 +42,6 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Println("Edit this file to enable optional features:")
 	fmt.Println("  - Set 'features.ollama_scan: true' (requires Ollama running: ollama serve)")
-	fmt.Println("  - Set 'features.vt_fallback: true' and export VIRUSTOTAL_API_KEY")
 
 	return nil
 }

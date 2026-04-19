@@ -5,8 +5,10 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/sud0x0/bsau/internal/brew"
+	"github.com/sud0x0/bsau/internal/config"
 	"github.com/sud0x0/bsau/internal/logger"
 	"github.com/sud0x0/bsau/internal/ollama"
+	"github.com/sud0x0/bsau/internal/report"
 	"github.com/sud0x0/bsau/internal/semgrep"
 	"github.com/sud0x0/bsau/internal/snapshot"
 	"github.com/sud0x0/bsau/internal/state"
@@ -41,87 +43,74 @@ func init() {
 	runCmd.Flags().BoolVar(&dryRun, "dry-run", false, "run scans but do not upgrade")
 }
 
-func runWorkflow(cmd *cobra.Command, args []string) error {
-	// Apply CLI overrides
-	cfg.NoOllama = noOllama
-	cfg.NoSemgrep = noSemgrep
-	cfg.DryRun = dryRun
+// upgradedPkg represents a package that was successfully upgraded
+type upgradedPkg struct {
+	Name       string
+	OldVersion string
+	NewVersion string
+}
 
-	// Close logger at the end
-	defer logger.Close()
+// Workflow holds all shared state for the bsau workflow
+type Workflow struct {
+	cfg            *config.Config
+	brewClient     *brew.Client
+	vulnScanner    *vuln.Scanner
+	prompter       *ui.Prompter
+	runMgr         *state.RunManager
+	snapshotMgr    *snapshot.Manager
+	sigHandler     *ui.SignalHandler
+	ollamaClient   *ollama.Client
+	semgrepRunner  *semgrep.Runner
+	scanReport     *report.Report
+	failures       []ui.ScanFailure
+	outdated       []brew.OutdatedPackage
+	vulnResults    map[string]*vuln.VulnResult
+	formulaResults map[string]*ollama.FormulaAnalysisResult
+	semgrepStatus  string
+	ollamaStatus   string
+}
 
-	// Initialize run manager (creates /tmp/bsau-<run-id>/)
-	runMgr, err := state.NewRunManager()
-	if err != nil {
-		return fmt.Errorf("initializing run manager: %w", err)
-	}
-	defer func() { _ = runMgr.Cleanup() }()
-	logger.Info("Run directory: %s", runMgr.RunDir())
-
-	// Initialize signal handler for graceful CTRL+C handling
-	sigHandler := ui.NewSignalHandler()
-	sigHandler.SetCleanup(func() {
-		ui.PrintInfo("Cleaning up...")
-		_ = runMgr.Cleanup()
-	})
-	sigHandler.Start()
-	defer sigHandler.Stop()
-
-	// Initialize clients
-	brewClient := brew.NewClient(cfg.HomebrewPath)
-	vulnScanner := vuln.NewScanner()
-	prompter := ui.NewPrompter()
-
-	// Track failures throughout the workflow
-	var failures []ui.ScanFailure
-
-	// === Step 1: Identify and audit current state ===
+// stepAudit executes Step 1: get outdated packages, query OSV/NVD, save pre-update vulns
+func (w *Workflow) stepAudit() error {
 	ui.PrintStep(1, 7, "Identify and Audit Current State",
 		"Scanning Homebrew packages, checking for outdated versions, and querying OSV/NIST NVD for vulnerabilities.")
 
-	outdated, err := brewClient.GetOutdated()
+	outdated, err := w.brewClient.GetOutdated()
 	if err != nil {
 		return fmt.Errorf("getting outdated packages: %w", err)
 	}
+	w.outdated = outdated
 
-	if len(outdated) == 0 {
+	if len(w.outdated) == 0 {
 		ui.PrintSuccess("All packages are up to date!")
 		return nil
 	}
 
-	ui.PrintInfo(fmt.Sprintf("Found %d outdated package(s)", len(outdated)))
-
-	// Get pinned packages
-	pinnedPkgs, _ := brewClient.GetPinnedPackages()
-	pinnedSet := make(map[string]bool)
-	for _, p := range pinnedPkgs {
-		pinnedSet[p] = true
-	}
+	ui.PrintInfo(fmt.Sprintf("Found %d outdated package(s)", len(w.outdated)))
 
 	// Query OSV and NIST NVD APIs for vulnerabilities
 	ui.PrintInfo("Scanning for known vulnerabilities...")
-	packageInfos := make([]vuln.PackageInfo, len(outdated))
-	for i, pkg := range outdated {
+	packageInfos := make([]vuln.PackageInfo, len(w.outdated))
+	for i, pkg := range w.outdated {
 		packageInfos[i] = vuln.PackageInfo{
-			Name:      pkg.Name,
-			Version:   pkg.InstalledVersion,
-			SourceURL: pkg.SourceURL,
+			Name:    pkg.Name,
+			Version: pkg.InstalledVersion,
 		}
 	}
 
-	vulnResults, vulnStats, err := vulnScanner.QueryPackages(packageInfos)
+	vulnResults, vulnStats, err := w.vulnScanner.QueryPackages(packageInfos)
 	if err != nil {
 		ui.PrintWarning(fmt.Sprintf("OSV API query failed: %v", err))
 		// Create placeholder results for all packages
 		vulnResults = make(map[string]*vuln.VulnResult)
-		for _, pkg := range outdated {
+		for _, pkg := range w.outdated {
 			vulnResults[pkg.Name] = &vuln.VulnResult{
 				Package:     pkg.Name,
 				Version:     pkg.InstalledVersion,
 				MaxSeverity: ui.SeverityNA,
 			}
 		}
-		failures = append(failures, ui.ScanFailure{
+		w.failures = append(w.failures, ui.ScanFailure{
 			Package: "all",
 			Step:    "OSV API",
 			Error:   err.Error(),
@@ -130,6 +119,7 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 		ui.PrintWarning(fmt.Sprintf("Failed to fetch details for %d/%d vulnerabilities (severity may show as UNKNOWN)",
 			vulnStats.FetchErrors, vulnStats.TotalVulns))
 	}
+	w.vulnResults = vulnResults
 
 	// Display query statistics
 	if vulnStats != nil {
@@ -139,7 +129,7 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 
 	// Save pre-update vulnerability results to run-scoped state
 	preUpdateVulns := make(map[string]interface{})
-	for name, result := range vulnResults {
+	for name, result := range w.vulnResults {
 		preUpdateVulns[name] = map[string]interface{}{
 			"package":      result.Package,
 			"version":      result.Version,
@@ -147,38 +137,54 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 			"max_severity": string(result.MaxSeverity),
 		}
 	}
-	if err := runMgr.SavePreUpdateVulns(preUpdateVulns); err != nil {
+	if err := w.runMgr.SavePreUpdateVulns(preUpdateVulns); err != nil {
 		ui.PrintWarning(fmt.Sprintf("Failed to save pre-update vuln state: %v", err))
 	}
 
-	// === Step 2: Identify what needs to be updated ===
+	return nil
+}
+
+// stepSelectPackages executes Step 2: create report, build table rows, render table, interactive selector
+// Returns the list of selected package names
+func (w *Workflow) stepSelectPackages(pinnedSet map[string]bool) ([]string, error) {
 	ui.PrintStep(2, 7, "Identify What Needs to Be Updated",
 		"Displaying outdated packages with vulnerability info. Select which packages to update.")
 
-	// Warn about skipped packages (no GitHub URL or unsupported registry)
-	if vulnStats != nil && vulnStats.PackagesSkipped > 0 {
-		ui.PrintWarning(fmt.Sprintf("%d package(s) could not be queried for vulnerabilities (no GitHub source URL or unsupported registry)",
-			vulnStats.PackagesSkipped))
+	// Create report file in binary directory
+	binDir, err := config.GetBinaryDir()
+	if err != nil {
+		ui.PrintWarning(fmt.Sprintf("Could not get binary directory for report: %v", err))
+		binDir = "."
 	}
+	scanReport, err := report.New(binDir)
+	if err != nil {
+		ui.PrintWarning(fmt.Sprintf("Could not create report file: %v", err))
+	} else {
+		ui.PrintInfo(fmt.Sprintf("Vulnerability report: %s", scanReport.FilePath()))
+	}
+	w.scanReport = scanReport
+
+	// Warn about OSV/NVD coverage limitations
+	ui.PrintWarning("CVE data sourced from OSV.dev and NIST NVD only. Additional vulnerabilities may exist in other databases.")
 
 	// Get package names for dependency check
-	outdatedNames := make([]string, len(outdated))
-	for i, pkg := range outdated {
+	outdatedNames := make([]string, len(w.outdated))
+	for i, pkg := range w.outdated {
 		outdatedNames[i] = pkg.Name
 	}
 
 	// Get dependency maps
 	ui.PrintInfo("Checking package dependencies...")
-	dependentsMap := brewClient.GetAllDependents(outdatedNames)     // packages that depend ON each package
-	dependenciesMap := brewClient.GetAllDependencies(outdatedNames) // packages that each package DEPENDS on
+	dependentsMap := w.brewClient.GetAllDependents(outdatedNames)
+	dependenciesMap := w.brewClient.GetAllDependencies(outdatedNames)
 
 	// Build table rows and selector items
-	rows := make([]ui.PackageRow, 0, len(outdated))
-	selectorItems := make([]ui.PackageItem, 0, len(outdated))
+	rows := make([]ui.PackageRow, 0, len(w.outdated))
+	selectorItems := make([]ui.PackageItem, 0, len(w.outdated))
 	hasUpdatable := false
 
-	for _, pkg := range outdated {
-		vr := vulnResults[pkg.Name]
+	for _, pkg := range w.outdated {
+		vr := w.vulnResults[pkg.Name]
 		isPinned := pkg.Pinned || pinnedSet[pkg.Name]
 
 		if !isPinned {
@@ -207,10 +213,29 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 			CVECount:     vr.CVECount,
 			Severity:     vr.MaxSeverity,
 			Pinned:       isPinned,
-			Selected:     !isPinned, // Pre-select non-pinned packages
+			Selected:     !isPinned,
 			Dependents:   dependentsMap[pkg.Name],
 			Dependencies: dependenciesMap[pkg.Name],
 		})
+
+		// Add to report
+		if w.scanReport != nil {
+			w.scanReport.AddPackage(pkg.Name, pkg.InstalledVersion, pkg.CurrentVersion, vr.CVECount, string(vr.MaxSeverity))
+			if len(vr.Vulns) > 0 {
+				details := make([]string, 0, len(vr.Vulns))
+				for _, v := range vr.Vulns {
+					details = append(details, fmt.Sprintf("%s (%s)", v.ID, v.Severity))
+				}
+				w.scanReport.AddVulnDetails(pkg.Name, details)
+			}
+		}
+	}
+
+	// Write vulnerability section to report
+	if w.scanReport != nil {
+		if err := w.scanReport.WriteVulnSection(); err != nil {
+			ui.PrintWarning(fmt.Sprintf("Failed to write vulnerability section to report: %v", err))
+		}
 	}
 
 	// Display the summary table first
@@ -218,100 +243,125 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 	ui.RenderPackageTable(rows)
 
 	// Warn about pinned packages with CVEs
-	for _, pkg := range outdated {
+	for _, pkg := range w.outdated {
 		isPinned := pkg.Pinned || pinnedSet[pkg.Name]
-		if isPinned && vulnResults[pkg.Name].CVECount > 0 {
-			ui.PrintWarning(fmt.Sprintf("Pinned package %s has %d known CVE(s)", pkg.Name, vulnResults[pkg.Name].CVECount))
+		if isPinned && w.vulnResults[pkg.Name].CVECount > 0 {
+			ui.PrintWarning(fmt.Sprintf("Pinned package %s has %d known CVE(s)", pkg.Name, w.vulnResults[pkg.Name].CVECount))
 		}
 	}
 
 	if !hasUpdatable {
 		ui.PrintInfo("No packages available for update (all pinned)")
-		return nil
+		return nil, nil
 	}
 
 	// Package selection
 	fmt.Println()
 	ui.PrintInfo("Press Enter to open package selector, or Esc to cancel...")
-	if !prompter.WaitForEnterOrEsc() {
+	if !w.prompter.WaitForEnterOrEsc() {
 		ui.PrintInfo("Cancelled")
-		return nil
+		return nil, nil
 	}
 
-	selectedPkgs, err := prompter.SelectPackagesInteractive(selectorItems)
+	selectedPkgs, err := w.prompter.SelectPackagesInteractive(selectorItems)
 	if err != nil {
-		return fmt.Errorf("selecting packages: %w", err)
+		return nil, fmt.Errorf("selecting packages: %w", err)
 	}
 
-	if len(selectedPkgs) == 0 {
-		ui.PrintInfo("No packages selected for update")
-		return nil
-	}
+	return selectedPkgs, nil
+}
 
-	// === Step 3: Pre-install security scan (Ollama formula analysis) ===
+// stepPreInstallScan executes Step 3: Ollama formula analysis
+func (w *Workflow) stepPreInstallScan(selectedPkgs []string) error {
 	ui.PrintStep(3, 7, "Pre-install Security Scan",
-		"Analyzing formula files with Ollama to detect malicious patterns before upgrade.")
+		"Analyzing formula files with OLLAMA LLM to detect malicious patterns before upgrade.")
 
-	var ollamaClient *ollama.Client
-	formulaResults := make(map[string]*ollama.FormulaAnalysisResult)
+	w.formulaResults = make(map[string]*ollama.FormulaAnalysisResult)
 
 	// Show scan status
 	fmt.Println("Scan status:")
-	if !cfg.IsOllamaEnabled() {
-		ui.PrintSkipped("Ollama formula analysis: disabled (enable with 'ollama_scan: true' in settings.yaml)")
+	if !w.cfg.IsOllamaEnabled() {
+		ui.PrintSkipped("OLLAMA LLM formula analysis: disabled (enable with 'ollama_scan: true' in settings.yaml)")
+		// Mark all selected packages as skipped for formula analysis
+		for _, pkgName := range selectedPkgs {
+			if w.scanReport != nil {
+				w.scanReport.SetFormulaAnalysis(pkgName, "disabled")
+			}
+		}
 		fmt.Println()
+		return nil
+	}
+
+	ui.PrintInfo("OLLAMA LLM formula analysis: enabled")
+	fmt.Println()
+	w.ollamaClient = ollama.NewClient(w.cfg.OllamaURL, w.cfg.OllamaModel, w.cfg.OllamaMaxFileBytes)
+	// Check if Ollama is actually running
+	if err := w.ollamaClient.CheckAvailability(); err != nil {
+		ui.PrintWarning(fmt.Sprintf("OLLAMA LLM not available: %v", err))
+		ui.PrintWarning("Make sure OLLAMA is running with: ollama serve")
+		w.ollamaClient = nil
+	}
+
+	if w.ollamaClient != nil {
+		ollamaProgress := ui.NewProgress("Analyzing formulas", len(selectedPkgs))
+		for _, pkgName := range selectedPkgs {
+			ollamaProgress.Update(pkgName)
+			versions, err := w.brewClient.GetFormulaVersions(pkgName)
+			if err != nil {
+				ollamaProgress.Clear()
+				ui.PrintWarning(fmt.Sprintf("Failed to get formula for %s: %v", pkgName, err))
+				ollamaProgress.Skip()
+				if w.scanReport != nil {
+					w.scanReport.SetFormulaAnalysis(pkgName, "failed")
+				}
+				continue
+			}
+
+			result, err := w.ollamaClient.AnalyzeFormula(pkgName, versions)
+			if err != nil {
+				ollamaProgress.Clear()
+				ui.PrintWarning(fmt.Sprintf("OLLAMA LLM analysis failed for %s: %v", pkgName, err))
+				result = &ollama.FormulaAnalysisResult{
+					Package: pkgName,
+					Verdict: ollama.VerdictReview,
+				}
+				if w.scanReport != nil {
+					w.scanReport.SetFormulaAnalysis(pkgName, "failed")
+				}
+			} else if w.scanReport != nil {
+				w.scanReport.SetFormulaAnalysis(pkgName, string(result.Verdict))
+			}
+			w.formulaResults[pkgName] = result
+		}
+		ollamaProgress.Done()
 	} else {
-		ui.PrintInfo("Ollama formula analysis: enabled")
-		fmt.Println()
-		ollamaClient = ollama.NewClient(cfg.OllamaURL, cfg.OllamaModel, cfg.OllamaMaxFileBytes)
-		// Check if Ollama is actually running
-		if err := ollamaClient.CheckAvailability(); err != nil {
-			ui.PrintWarning(fmt.Sprintf("Ollama not available: %v", err))
-			ui.PrintWarning("Make sure Ollama is running with: ollama serve")
-			ollamaClient = nil
-		}
-
-		if ollamaClient != nil {
-			ollamaProgress := ui.NewProgress("Analyzing formulas", len(selectedPkgs))
-			for _, pkgName := range selectedPkgs {
-				ollamaProgress.Update(pkgName)
-				versions, err := brewClient.GetFormulaVersions(pkgName)
-				if err != nil {
-					ollamaProgress.Clear()
-					ui.PrintWarning(fmt.Sprintf("Failed to get formula for %s: %v", pkgName, err))
-					continue
-				}
-
-				result, err := ollamaClient.AnalyzeFormula(pkgName, versions)
-				if err != nil {
-					ollamaProgress.Clear()
-					ui.PrintWarning(fmt.Sprintf("Ollama analysis failed for %s: %v", pkgName, err))
-					result = &ollama.FormulaAnalysisResult{
-						Package: pkgName,
-						Verdict: ollama.VerdictReview,
-					}
-				}
-				formulaResults[pkgName] = result
+		// Ollama not available, mark all as skipped
+		for _, pkgName := range selectedPkgs {
+			if w.scanReport != nil {
+				w.scanReport.SetFormulaAnalysis(pkgName, "skipped")
 			}
-			ollamaProgress.Done()
-		}
-
-		// Save Ollama formula analysis results to run-scoped state
-		scanResults := make(map[string]interface{})
-		for name, result := range formulaResults {
-			scanResults[name] = map[string]interface{}{
-				"package":    result.Package,
-				"verdict":    string(result.Verdict),
-				"confidence": result.Confidence,
-				"findings":   result.Findings,
-			}
-		}
-		if err := runMgr.SaveScanResults(scanResults); err != nil {
-			ui.PrintWarning(fmt.Sprintf("Failed to save scan results: %v", err))
 		}
 	}
 
-	// === Step 4: Per-package approval gate ===
+	// Save Ollama formula analysis results to run-scoped state
+	scanResults := make(map[string]interface{})
+	for name, result := range w.formulaResults {
+		scanResults[name] = map[string]interface{}{
+			"package":    result.Package,
+			"verdict":    string(result.Verdict),
+			"confidence": result.Confidence,
+			"findings":   result.Findings,
+		}
+	}
+	if err := w.runMgr.SaveScanResults(scanResults); err != nil {
+		ui.PrintWarning(fmt.Sprintf("Failed to save scan results: %v", err))
+	}
+
+	return nil
+}
+
+// stepApproval executes Step 4: approval gate; returns approved package names
+func (w *Workflow) stepApproval(selectedPkgs []string) ([]string, error) {
 	ui.PrintStep(4, 7, "Per-Package Approval Gate",
 		"Review scan results and approve packages for upgrade. Blocked packages require manual review.")
 
@@ -319,8 +369,8 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 	approvedPkgs := make([]string, 0)
 
 	for _, pkgName := range selectedPkgs {
-		vr := vulnResults[pkgName]
-		fr := formulaResults[pkgName]
+		vr := w.vulnResults[pkgName]
+		fr := w.formulaResults[pkgName]
 
 		recommendation := "PROCEED"
 		var verdict ollama.Verdict
@@ -329,7 +379,7 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 			verdict = fr.Verdict
 			switch verdict {
 			case ollama.VerdictHold:
-				if cfg.BlockPolicy.OllamaFormulaHold {
+				if w.cfg.BlockPolicy.OllamaFormulaHold {
 					recommendation = "BLOCK"
 				} else {
 					recommendation = "REVIEW"
@@ -348,19 +398,36 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Println()
-	ui.RenderPreInstallTable(preInstallRows, cfg.IsOllamaEnabled())
+	ui.RenderPreInstallTable(preInstallRows, w.cfg.IsOllamaEnabled())
 
 	// Process approvals
 	for _, row := range preInstallRows {
 		if row.Recommendation == "BLOCK" {
-			ui.PrintWarning(fmt.Sprintf("Package %s blocked: Ollama returned HOLD verdict", row.Package))
+			ui.PrintWarning(fmt.Sprintf("Package %s blocked: OLLAMA LLM returned HOLD verdict", row.Package))
+			// Show findings if available
+			if fr := w.formulaResults[row.Package]; fr != nil && len(fr.Findings) > 0 {
+				for _, f := range fr.Findings {
+					ui.PrintWarning(fmt.Sprintf("  - %s", f.Description))
+				}
+			}
 			continue
 		}
 
 		if row.Recommendation == "REVIEW" {
-			approved, err := prompter.ConfirmPackageUpgrade(row.Package, row.OllamaVerdict, "Requires manual review")
+			// Build reason from findings if available
+			reason := "Requires manual review"
+			if fr := w.formulaResults[row.Package]; fr != nil && len(fr.Findings) > 0 {
+				reason = ""
+				for _, f := range fr.Findings {
+					if reason != "" {
+						reason += "; "
+					}
+					reason += f.Description
+				}
+			}
+			approved, err := w.prompter.ConfirmPackageUpgrade(row.Package, row.OllamaVerdict, reason)
 			if err != nil {
-				return fmt.Errorf("confirming upgrade: %w", err)
+				return nil, fmt.Errorf("confirming upgrade: %w", err)
 			}
 			if !approved {
 				continue
@@ -370,38 +437,28 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 		approvedPkgs = append(approvedPkgs, row.Package)
 	}
 
-	if len(approvedPkgs) == 0 {
-		ui.PrintInfo("No packages approved for upgrade")
-		return nil
-	}
+	return approvedPkgs, nil
+}
 
-	if dryRun {
-		ui.PrintInfo("Dry run - skipping upgrades")
-		fmt.Println("Would upgrade:", approvedPkgs)
-		return nil
-	}
-
-	// === Step 5: Upgrade ===
+// stepUpgrade executes Step 5: snapshot + brew upgrade; returns upgraded slice, failed count, and error
+func (w *Workflow) stepUpgrade(approvedPkgs []string) ([]upgradedPkg, int, error) {
 	ui.PrintStep(5, 7, "Upgrade Packages",
 		"Creating pre-upgrade snapshots and running brew upgrade for each approved package.")
-	ui.PrintRunDir(runMgr.RunDir())
+	ui.PrintRunDir(w.runMgr.RunDir())
 	ui.PrintInfo(fmt.Sprintf("Upgrading %d package(s)...", len(approvedPkgs)))
 
 	// Mark as in-progress so CTRL+C prompts before exiting
-	sigHandler.SetInProgress(true)
+	w.sigHandler.SetInProgress(true)
+	defer w.sigHandler.SetInProgress(false)
 
-	snapshotMgr := snapshot.NewManager(runMgr.SnapshotsDir())
-	upgraded := make([]struct {
-		Name       string
-		OldVersion string
-		NewVersion string
-	}, 0)
+	w.snapshotMgr = snapshot.NewManager(w.runMgr.SnapshotsDir())
+	upgraded := make([]upgradedPkg, 0)
 	failed := 0
 
 	for _, pkgName := range approvedPkgs {
 		// Get current version info
 		var pkg brew.OutdatedPackage
-		for _, p := range outdated {
+		for _, p := range w.outdated {
 			if p.Name == pkgName {
 				pkg = p
 				break
@@ -409,8 +466,8 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 		}
 
 		// Check disk space for snapshot
-		pkgPath := brewClient.PackagePath(pkgName, pkg.InstalledVersion)
-		diskCheck, err := snapshotMgr.CheckDiskSpace(pkgPath)
+		pkgPath := w.brewClient.PackagePath(pkgName, pkg.InstalledVersion)
+		diskCheck, err := w.snapshotMgr.CheckDiskSpace(pkgPath)
 		if err != nil {
 			ui.PrintWarning(fmt.Sprintf("Failed to check disk space for %s: %v", pkgName, err))
 		}
@@ -422,12 +479,12 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 				ui.PrintWarning(fmt.Sprintf("Skipping snapshot for %s - post-install scan will be limited", pkgName))
 			} else if diskCheck.NeedsPrompt {
 				ui.PrintWarning(diskCheck.WarningMessage)
-				proceed, _ := prompter.Confirm("Continue with snapshot?", false)
+				proceed, _ := w.prompter.Confirm("Continue with snapshot?", false)
 				if proceed {
-					snapshotPath, _ = snapshotMgr.CreateSnapshot(pkgPath, pkgName, pkg.InstalledVersion)
+					snapshotPath, _ = w.snapshotMgr.CreateSnapshot(pkgPath, pkgName, pkg.InstalledVersion)
 				}
 			} else if diskCheck.CanProceed {
-				snapshotPath, err = snapshotMgr.CreateSnapshot(pkgPath, pkgName, pkg.InstalledVersion)
+				snapshotPath, err = w.snapshotMgr.CreateSnapshot(pkgPath, pkgName, pkg.InstalledVersion)
 				if err != nil {
 					ui.PrintWarning(fmt.Sprintf("Failed to create snapshot for %s: %v", pkgName, err))
 				}
@@ -436,79 +493,79 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 
 		// Run upgrade
 		fmt.Printf("\n>>> Upgrading %s...\n", pkgName)
-		if err := brewClient.Upgrade(pkgName); err != nil {
+		if err := w.brewClient.Upgrade(pkgName); err != nil {
 			ui.PrintError(fmt.Sprintf("Failed to upgrade %s: %v", pkgName, err))
 			failed++
+			if w.scanReport != nil {
+				w.scanReport.SetUpdated(pkgName, false, err.Error())
+			}
 			// Clean up snapshot on failure
 			if snapshotPath != "" {
-				_ = snapshotMgr.Cleanup(pkgName)
+				_ = w.snapshotMgr.Cleanup(pkgName)
 			}
 			break // Don't continue on failure per spec
 		}
 
 		// Get new version
-		info, err := brewClient.Info(pkgName)
+		info, err := w.brewClient.Info(pkgName)
 		if err != nil {
 			ui.PrintWarning(fmt.Sprintf("Failed to get new version for %s: %v", pkgName, err))
 			info = &brew.Package{Version: "unknown"}
 		}
 
-		upgraded = append(upgraded, struct {
-			Name       string
-			OldVersion string
-			NewVersion string
-		}{pkgName, pkg.InstalledVersion, info.Version})
+		upgraded = append(upgraded, upgradedPkg{
+			Name:       pkgName,
+			OldVersion: pkg.InstalledVersion,
+			NewVersion: info.Version,
+		})
+
+		if w.scanReport != nil {
+			w.scanReport.SetUpdated(pkgName, true, "")
+		}
 
 		ui.PrintSuccess(fmt.Sprintf("Upgraded %s: %s -> %s", pkgName, pkg.InstalledVersion, info.Version))
 	}
 
-	// Upgrades complete, no longer in critical section
-	sigHandler.SetInProgress(false)
+	return upgraded, failed, nil
+}
 
-	if len(upgraded) == 0 {
-		ui.PrintError("No packages were upgraded")
-		return nil
-	}
-
-	// === Step 6: Post-install verification ===
+// stepVerify executes Step 6: semgrep + ollama post-install verification
+func (w *Workflow) stepVerify(upgraded []upgradedPkg) ([]ui.PostInstallRow, error) {
 	ui.PrintStep(6, 7, "Post-Install Verification",
-		"Verifying upgraded packages with Semgrep scan and local LLM code analysis.")
-
-	// Track scan status for final report
-	var semgrepStatus, ollamaStatus string
+		"Verifying upgraded packages with Semgrep and OLLAMA LLM code analysis.\n  Note: Both tools can miss sophisticated attacks - using both provides defense in depth.")
 
 	// Show scan status
 	fmt.Println("Scan status:")
 
 	// Initialize Semgrep
-	var semgrepRunner *semgrep.Runner
-	if cfg.NoSemgrep {
+	if w.cfg.NoSemgrep {
 		ui.PrintSkipped("Semgrep scan: skipped (--no-semgrep)")
-		semgrepStatus = "skipped (--no-semgrep)"
+		w.semgrepStatus = "skipped (--no-semgrep)"
 	} else {
-		semgrepRunner, err = semgrep.NewRunner()
+		var err error
+		w.semgrepRunner, err = semgrep.NewRunner()
 		if err != nil {
 			ui.PrintSkipped(fmt.Sprintf("Semgrep scan: not available (%v)", err))
-			semgrepStatus = fmt.Sprintf("not run (not available: %v)", err)
+			w.semgrepStatus = fmt.Sprintf("not run (not available: %v)", err)
 		} else {
 			ui.PrintInfo("Semgrep scan: enabled")
-			semgrepStatus = "completed"
+			w.semgrepStatus = "completed"
 		}
 	}
 
-	// Ollama code analysis status
-	if cfg.IsOllamaEnabled() && ollamaClient != nil {
-		ui.PrintInfo("Local LLM code analysis: enabled")
-		ollamaStatus = "completed"
-	} else if cfg.NoOllama {
-		ui.PrintSkipped("Local LLM code analysis: skipped (--no-ollama)")
-		ollamaStatus = "skipped (--no-ollama)"
-	} else if !cfg.Features.OllamaScan {
-		ui.PrintSkipped("Local LLM code analysis: disabled in config")
-		ollamaStatus = "disabled in config"
+	// OLLAMA LLM code analysis status
+	if w.cfg.IsOllamaEnabled() && w.ollamaClient != nil {
+		ui.PrintInfo("OLLAMA LLM code analysis: enabled")
+		w.ollamaStatus = "completed"
+	} else if w.cfg.NoOllama {
+		ui.PrintSkipped("OLLAMA LLM code analysis: skipped (--no-ollama)")
+		w.ollamaStatus = "skipped (--no-ollama)"
+	} else if !w.cfg.Features.OllamaScan {
+		ui.PrintSkipped("OLLAMA LLM code analysis: disabled in config")
+		w.ollamaStatus = "disabled in config"
 	} else {
-		ui.PrintSkipped("Local LLM code analysis: not available (Ollama not running)")
-		ollamaStatus = "not run (Ollama not running)"
+		ui.PrintSkipped("OLLAMA LLM code analysis: not available (OLLAMA not running)")
+		w.ollamaStatus = "not run (OLLAMA not running)"
 	}
 	fmt.Println()
 
@@ -523,23 +580,30 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 			Overall: "OK",
 		}
 
+		// Track semgrep result for reuse in Ollama analysis
+		var lastSemgrepResult *semgrep.PackageScanResult
+
 		// Semgrep scan
 		verifyProgress.Update(fmt.Sprintf("%s (semgrep)", pkg.Name))
-		if semgrepRunner != nil {
-			semgrepResult, err := semgrepRunner.ScanPackage(
-				brewClient.CellarPath(),
+		if w.semgrepRunner != nil {
+			semgrepResult, err := w.semgrepRunner.ScanPackage(
+				w.brewClient.CellarPath(),
 				pkg.Name,
 				pkg.NewVersion,
 			)
 			if err != nil {
 				verifyProgress.Clear()
 				ui.PrintWarning(fmt.Sprintf("Semgrep scan failed for %s: %v", pkg.Name, err))
-				failures = append(failures, ui.ScanFailure{
+				w.failures = append(w.failures, ui.ScanFailure{
 					Package: pkg.Name,
 					Step:    "Semgrep",
 					Error:   err.Error(),
 				})
+				if w.scanReport != nil {
+					w.scanReport.SetSemgrepScan(pkg.Name, "failed")
+				}
 			} else {
+				lastSemgrepResult = semgrepResult
 				row.SemgrepCount = semgrepResult.FindingCount
 				if semgrepResult.HasFindings && row.Overall == "OK" {
 					row.Overall = "REVIEW"
@@ -550,49 +614,67 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 					"has_findings":  semgrepResult.HasFindings,
 					"findings":      semgrepResult.Findings,
 				}
+				if w.scanReport != nil {
+					if semgrepResult.FindingCount > 0 {
+						w.scanReport.SetSemgrepScan(pkg.Name, fmt.Sprintf("%d findings", semgrepResult.FindingCount))
+					} else {
+						w.scanReport.SetSemgrepScan(pkg.Name, "clean")
+					}
+				}
 			}
+		} else if w.scanReport != nil {
+			w.scanReport.SetSemgrepScan(pkg.Name, "skipped")
 		}
 
 		// Diff and Ollama code analysis
-		if cfg.IsOllamaEnabled() && ollamaClient != nil {
+		if w.cfg.IsOllamaEnabled() && w.ollamaClient != nil {
 			// Generate diff if we have a snapshot
-			snapshotPath := runMgr.PackageSnapshotDir(pkg.Name, pkg.OldVersion)
-			newPath := brewClient.PackagePath(pkg.Name, pkg.NewVersion)
+			snapshotPath := w.runMgr.PackageSnapshotDir(pkg.Name, pkg.OldVersion)
+			newPath := w.brewClient.PackagePath(pkg.Name, pkg.NewVersion)
 
-			diff, err := snapshotMgr.GenerateDiff(snapshotPath, newPath)
+			diff, err := w.snapshotMgr.GenerateDiff(snapshotPath, newPath)
 			if err == nil && diff != "" {
 				semgrepFindings := ""
-				if semgrepRunner != nil {
-					semgrepResult, _ := semgrepRunner.ScanPackage(brewClient.CellarPath(), pkg.Name, pkg.NewVersion)
-					if semgrepResult != nil {
-						semgrepFindings = semgrep.FormatFindings(semgrepResult.Findings)
-					}
+				if lastSemgrepResult != nil {
+					semgrepFindings = semgrep.FormatFindings(lastSemgrepResult.Findings)
 				}
 
-				codeResult, err := ollamaClient.AnalyzeCode(pkg.Name, pkg.OldVersion, pkg.NewVersion, diff, semgrepFindings)
+				codeResult, err := w.ollamaClient.AnalyzeCode(pkg.Name, pkg.OldVersion, pkg.NewVersion, diff, semgrepFindings)
 				if err != nil {
-					ui.PrintWarning(fmt.Sprintf("Ollama code analysis failed for %s: %v", pkg.Name, err))
-					failures = append(failures, ui.ScanFailure{
+					ui.PrintWarning(fmt.Sprintf("OLLAMA LLM code analysis failed for %s: %v", pkg.Name, err))
+					w.failures = append(w.failures, ui.ScanFailure{
 						Package: pkg.Name,
-						Step:    "Ollama Code",
+						Step:    "OLLAMA LLM Code",
 						Error:   err.Error(),
 					})
+					if w.scanReport != nil {
+						w.scanReport.SetOllamaMalwareScan(pkg.Name, "failed")
+					}
 				} else {
 					row.OllamaVerdict = codeResult.Verdict
 					if codeResult.Verdict == ollama.VerdictHold {
-						if cfg.BlockPolicy.OllamaCodeHold {
+						if w.cfg.BlockPolicy.OllamaCodeHold {
 							row.Overall = "BLOCK"
-							ui.PrintError(fmt.Sprintf("Package %s flagged by Ollama - consider `brew uninstall %s`", pkg.Name, pkg.Name))
+							ui.PrintError(fmt.Sprintf("Package %s flagged by OLLAMA LLM - consider `brew uninstall %s`", pkg.Name, pkg.Name))
 						} else {
 							row.Overall = "REVIEW"
 						}
+					} else if codeResult.Verdict == ollama.VerdictReview && row.Overall == "OK" {
+						row.Overall = "REVIEW"
+					}
+					if w.scanReport != nil {
+						w.scanReport.SetOllamaMalwareScan(pkg.Name, string(codeResult.Verdict))
 					}
 				}
+			} else if w.scanReport != nil {
+				w.scanReport.SetOllamaMalwareScan(pkg.Name, "no diff")
 			}
+		} else if w.scanReport != nil {
+			w.scanReport.SetOllamaMalwareScan(pkg.Name, "skipped")
 		}
 
 		// Cleanup snapshot after analysis
-		_ = runMgr.CleanupPackageSnapshot(pkg.Name)
+		_ = w.runMgr.CleanupPackageSnapshot(pkg.Name)
 
 		postInstallRows = append(postInstallRows, row)
 	}
@@ -600,7 +682,7 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 
 	// Save semgrep results to run-scoped state
 	if len(semgrepResultsMap) > 0 {
-		if err := runMgr.SaveSemgrepResults(semgrepResultsMap); err != nil {
+		if err := w.runMgr.SaveSemgrepResults(semgrepResultsMap); err != nil {
 			ui.PrintWarning(fmt.Sprintf("Failed to save semgrep results: %v", err))
 		}
 	}
@@ -608,7 +690,7 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 	// === Post-update summary ===
 	ui.PrintInfo("Post-update summary:")
 	fmt.Println()
-	ui.RenderPostInstallTable(postInstallRows, cfg.IsOllamaEnabled())
+	ui.RenderPostInstallTable(postInstallRows, w.cfg.IsOllamaEnabled())
 
 	// Re-check vulnerabilities for summary using osv-scanner
 	cvesResolved := 0
@@ -617,26 +699,17 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 	// Build package info for post-upgrade OSV query
 	postPackageInfos := make([]vuln.PackageInfo, len(upgraded))
 	for i, pkg := range upgraded {
-		// Find the source URL from the original outdated list
-		sourceURL := ""
-		for _, op := range outdated {
-			if op.Name == pkg.Name {
-				sourceURL = op.SourceURL
-				break
-			}
-		}
 		postPackageInfos[i] = vuln.PackageInfo{
-			Name:      pkg.Name,
-			Version:   pkg.NewVersion,
-			SourceURL: sourceURL,
+			Name:    pkg.Name,
+			Version: pkg.NewVersion,
 		}
 	}
 
 	ui.PrintInfo("Checking post-upgrade vulnerabilities...")
-	postVulnResults, postVulnStats, err := vulnScanner.QueryPackages(postPackageInfos)
+	postVulnResults, postVulnStats, err := w.vulnScanner.QueryPackages(postPackageInfos)
 	if err != nil {
 		ui.PrintWarning(fmt.Sprintf("Post-upgrade OSV query failed: %v", err))
-		failures = append(failures, ui.ScanFailure{
+		w.failures = append(w.failures, ui.ScanFailure{
 			Package: "all",
 			Step:    "Post-upgrade OSV",
 			Error:   err.Error(),
@@ -648,7 +721,7 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 
 	for _, pkg := range upgraded {
 		preCount := 0
-		if preResult, ok := vulnResults[pkg.Name]; ok {
+		if preResult, ok := w.vulnResults[pkg.Name]; ok {
 			preCount = preResult.CVECount
 		}
 		postCount := 0
@@ -661,20 +734,24 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 		cvesRemaining += postCount
 	}
 
-	ui.RenderSummary(len(upgraded), failed, cvesResolved, cvesRemaining)
+	ui.RenderSummary(len(upgraded), 0, cvesResolved, cvesRemaining)
 
 	// Render failure summary if there were any failures
-	if len(failures) > 0 {
-		ui.RenderFailureSummary(failures, len(outdated))
+	if len(w.failures) > 0 {
+		ui.RenderFailureSummary(w.failures, len(w.outdated))
 	}
 
-	// === Step 7: Cleanup ===
+	return postInstallRows, nil
+}
+
+// stepCleanup executes Step 7: runMgr cleanup + brew cleanup + final report
+func (w *Workflow) stepCleanup() error {
 	ui.PrintStep(7, 7, "Cleanup",
 		"Removing temporary files and running brew cleanup to free disk space.")
 
 	// Clean up temporary run directory (snapshots, state files)
 	ui.PrintInfo("Cleaning up temporary files...")
-	if err := runMgr.Cleanup(); err != nil {
+	if err := w.runMgr.Cleanup(); err != nil {
 		ui.PrintWarning(fmt.Sprintf("Failed to cleanup run directory: %v", err))
 	} else {
 		ui.PrintSuccess("Temporary files removed")
@@ -682,7 +759,7 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 
 	// Run brew cleanup to remove old versions
 	ui.PrintInfo("Running brew cleanup...")
-	if err := brewClient.Cleanup(); err != nil {
+	if err := w.brewClient.Cleanup(); err != nil {
 		ui.PrintWarning(fmt.Sprintf("Brew cleanup failed: %v", err))
 	} else {
 		ui.PrintSuccess("Brew cleanup complete")
@@ -691,26 +768,136 @@ func runWorkflow(cmd *cobra.Command, args []string) error {
 	// Final scan status summary
 	fmt.Println()
 	fmt.Println("=== Scan Summary ===")
-	fmt.Printf("Vulnerability scan: completed\n")
-	fmt.Printf("Semgrep scan: %s\n", semgrepStatus)
-	fmt.Printf("Local LLM analysis: %s\n", ollamaStatus)
 
-	// Display vulnerability report
-	hasVulns := false
-	for _, vr := range vulnResults {
-		if vr.CVECount > 0 {
-			hasVulns = true
-			break
+	// Write final summary to report and display
+	if w.scanReport != nil {
+		if err := w.scanReport.WriteFinalSummary(); err != nil {
+			ui.PrintWarning(fmt.Sprintf("Failed to write final summary to report: %v", err))
 		}
-	}
-	if hasVulns {
 		fmt.Println()
-		vulnReport := vuln.GenerateVulnReport(vulnResults)
-		fmt.Print(vulnReport)
+		fmt.Print(w.scanReport.GetSummary())
+		fmt.Println()
+		ui.PrintInfo(fmt.Sprintf("Full report saved to: %s", w.scanReport.FilePath()))
+	} else {
+		// Fallback if report not available
+		fmt.Printf("Vulnerability scan: completed\n")
+		fmt.Printf("Semgrep scan: %s\n", w.semgrepStatus)
+		fmt.Printf("Local LLM analysis: %s\n", w.ollamaStatus)
 	}
 
 	fmt.Println()
 	ui.PrintSuccess("All done!")
 
 	return nil
+}
+
+func runWorkflow(cmd *cobra.Command, args []string) error {
+	// Apply CLI overrides
+	cfg.NoOllama = noOllama
+	cfg.NoSemgrep = noSemgrep
+	cfg.DryRun = dryRun
+
+	// Close logger at the end
+	defer logger.Close()
+
+	// Initialize run manager (creates /tmp/bsau-<run-id>/)
+	runMgr, err := state.NewRunManager()
+	if err != nil {
+		return fmt.Errorf("initializing run manager: %w", err)
+	}
+	defer func() { _ = runMgr.Cleanup() }()
+	logger.Info("Run directory: %s", runMgr.RunDir())
+
+	// Initialize signal handler for graceful CTRL+C handling
+	sigHandler := ui.NewSignalHandler()
+	sigHandler.SetCleanup(func() {
+		ui.PrintInfo("Cleaning up...")
+		_ = runMgr.Cleanup()
+	})
+	sigHandler.Start()
+	defer sigHandler.Stop()
+
+	// Initialize workflow
+	w := &Workflow{
+		cfg:         cfg,
+		brewClient:  brew.NewClient(cfg.HomebrewPath),
+		vulnScanner: vuln.NewScanner(),
+		prompter:    ui.NewPrompter(),
+		runMgr:      runMgr,
+		sigHandler:  sigHandler,
+		failures:    []ui.ScanFailure{},
+	}
+
+	// === Step 1: Identify and audit current state ===
+	if err := w.stepAudit(); err != nil {
+		return err
+	}
+
+	// Exit if no outdated packages
+	if len(w.outdated) == 0 {
+		return nil
+	}
+
+	// Get pinned packages
+	pinnedPkgs, _ := w.brewClient.GetPinnedPackages()
+	pinnedSet := make(map[string]bool)
+	for _, p := range pinnedPkgs {
+		pinnedSet[p] = true
+	}
+
+	// === Step 2: Identify what needs to be updated ===
+	selectedPkgs, err := w.stepSelectPackages(pinnedSet)
+	if err != nil {
+		return err
+	}
+
+	// Exit if no packages selected
+	if len(selectedPkgs) == 0 {
+		return nil
+	}
+
+	// === Step 3: Pre-install security scan ===
+	if err := w.stepPreInstallScan(selectedPkgs); err != nil {
+		return err
+	}
+
+	// === Step 4: Per-package approval gate ===
+	approvedPkgs, err := w.stepApproval(selectedPkgs)
+	if err != nil {
+		return err
+	}
+
+	// Exit if no packages approved
+	if len(approvedPkgs) == 0 {
+		ui.PrintInfo("No packages approved for upgrade")
+		return nil
+	}
+
+	// Exit if dry run
+	if dryRun {
+		ui.PrintInfo("Dry run - skipping upgrades")
+		fmt.Println("Would upgrade:", approvedPkgs)
+		return nil
+	}
+
+	// === Step 5: Upgrade ===
+	upgraded, _, err := w.stepUpgrade(approvedPkgs)
+	if err != nil {
+		return err
+	}
+
+	// Exit if no packages were upgraded
+	if len(upgraded) == 0 {
+		ui.PrintError("No packages were upgraded")
+		return nil
+	}
+
+	// === Step 6: Post-install verification ===
+	_, err = w.stepVerify(upgraded)
+	if err != nil {
+		return err
+	}
+
+	// === Step 7: Cleanup ===
+	return w.stepCleanup()
 }

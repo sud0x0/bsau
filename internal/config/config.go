@@ -140,14 +140,18 @@ homebrew_path: /opt/homebrew
 features:
   # Enable local LLM analysis (requires Ollama running locally)
   # Install: brew install ollama && ollama pull <model>
+  # NOTE: If the Ollama server does not have adequate resources (CPU/GPU/RAM),
+  # scans will take significantly longer. Each file chunk can take 30-60+ seconds.
+  # For best performance, use a machine with a dedicated GPU or Apple Silicon.
   ollama_scan: false
 
 # Ollama server URL (default: http://localhost:11434)
 ollama_url: http://localhost:11434
 
 # LLM model to use for analysis (required when ollama_scan is enabled)
-# Examples: gemma3, llama3, mistral, codellama, etc.
+# Examples: gemma4:e2b, llama3, mistral, etc.
 # Run 'ollama list' to see available models
+# Smaller models (e.g., gemma4:e2b) are faster but may be less accurate
 ollama_model: ""
 
 # Maximum formula file size in bytes sent to LLM

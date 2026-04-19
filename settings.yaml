@@ -6,7 +6,7 @@ homebrew_path: /opt/homebrew
 # Feature flags — opt-in to scans that require external dependencies.
 # OSV vulnerability scanning always runs without any key.
 features:
-  ollama_scan: false      # Requires Ollama running locally (ollama serve)
+  ollama_scan: true      # Requires Ollama running locally (ollama serve)
 
 # Blocking policy.
 # Pre-install (Step 3): Ollama formula analysis.
@@ -16,11 +16,11 @@ block_policy:
   ollama_code_hold: true      # Block if Ollama code analysis returns HOLD (Step 6a)
 
 # Ollama server URL (default: http://localhost:11434)
-ollama_url: http://localhost:11434
+ollama_url: http://10.211.55.41:11434
 
 # Ollama model to use for analysis (default: gemma3)
 # Requires: ollama pull gemma3
-ollama_model: gemma3
+ollama_model: gemma4:e2b
 
 # Maximum file size in bytes sent to Ollama. Larger files are truncated.
 ollama_max_file_bytes: 12000

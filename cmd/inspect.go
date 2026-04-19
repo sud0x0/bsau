@@ -26,14 +26,16 @@ var inspectCmd = &cobra.Command{
 	Long: `Inspect runs security checks against the current installed state
 of your Homebrew packages without any upgrade.
 
-By default, runs all checks: Vulnerability scan + Semgrep + Ollama (if enabled).
+By default, runs all checks: Vulnerability scan + Semgrep + OLLAMA LLM (if enabled).
 Use --no-vuln, --no-semgrep, or --no-ollama to skip specific checks.
+
+Note: Both Semgrep and OLLAMA LLM can miss sophisticated attacks - using both provides defense in depth.
 
 Examples:
   bsau inspect                       # Show this help menu
   bsau inspect <package>             # Scan specific package (all checks)
   bsau inspect --all                 # Scan all installed packages
-  bsau inspect <package> --no-ollama # Skip Ollama analysis
+  bsau inspect <package> --no-ollama # Skip OLLAMA LLM analysis
   bsau inspect <package> --no-ollama --no-semgrep  # Vulnerability scan only`,
 	RunE: runInspect,
 }
@@ -41,7 +43,7 @@ Examples:
 func init() {
 	inspectCmd.Flags().BoolVar(&inspectNoVuln, "no-vuln", false, "skip vulnerability scan")
 	inspectCmd.Flags().BoolVar(&inspectNoSemgrep, "no-semgrep", false, "skip Semgrep scan")
-	inspectCmd.Flags().BoolVar(&inspectNoOllama, "no-ollama", false, "skip Ollama analysis")
+	inspectCmd.Flags().BoolVar(&inspectNoOllama, "no-ollama", false, "skip OLLAMA LLM analysis")
 	inspectCmd.Flags().BoolVar(&inspectAll, "all", false, "scan all installed packages")
 }
 
@@ -72,10 +74,10 @@ func runInspect(cmd *cobra.Command, args []string) error {
 	sigHandler.Start()
 	defer sigHandler.Stop()
 
-	// Warn if Ollama is requested but not available
+	// Warn if OLLAMA LLM is requested but not available
 	if !inspectNoOllama && !cfg.IsOllamaEnabled() {
-		ui.PrintWarning("Ollama is not enabled in config.")
-		ui.PrintInfo("To enable Ollama, set features.ollama_scan: true in settings.yaml")
+		ui.PrintWarning("OLLAMA LLM is not enabled in config.")
+		ui.PrintInfo("To enable OLLAMA LLM, set features.ollama_scan: true in settings.yaml")
 	}
 
 	// Initialize clients
@@ -154,9 +156,9 @@ func runInspect(cmd *cobra.Command, args []string) error {
 		ollamaClient = ollama.NewClient(cfg.OllamaURL, cfg.OllamaModel, cfg.OllamaMaxFileBytes)
 		// Check if Ollama is actually running
 		if err := ollamaClient.CheckAvailability(); err != nil {
-			ui.PrintWarning(fmt.Sprintf("Ollama not available: %v", err))
-			ui.PrintWarning("Make sure Ollama is running with: ollama serve")
-			logger.Warn("Ollama not available: %v", err)
+			ui.PrintWarning(fmt.Sprintf("OLLAMA LLM not available: %v", err))
+			ui.PrintWarning("Make sure OLLAMA is running with: ollama serve")
+			logger.Warn("OLLAMA LLM not available: %v", err)
 			runOllamaCheck = false
 		}
 	}
@@ -217,14 +219,14 @@ func runInspect(cmd *cobra.Command, args []string) error {
 				logger.Error("Failed to collect files for %s: %v", pkg.Name, err)
 			} else if len(files) > 0 {
 				ui.PrintInfo(fmt.Sprintf("Analyzing %d text files for %s...", len(files), pkg.Name))
-				logger.Info("Ollama analyzing %d files for %s", len(files), pkg.Name)
+				logger.Info("OLLAMA LLM analyzing %d files for %s", len(files), pkg.Name)
 				codeResult, err := ollamaClient.AnalyzeFiles(pkg.Name, files, semgrepFindings)
 				if err != nil {
-					ui.PrintWarning(fmt.Sprintf("Ollama analysis failed for %s: %v", pkg.Name, err))
-					logger.Error("Ollama analysis failed for %s: %v", pkg.Name, err)
+					ui.PrintWarning(fmt.Sprintf("OLLAMA LLM analysis failed for %s: %v", pkg.Name, err))
+					logger.Error("OLLAMA LLM analysis failed for %s: %v", pkg.Name, err)
 				} else {
 					row.OllamaVerdict = codeResult.Verdict
-					logger.Result("Ollama", pkg.Name, string(codeResult.Verdict))
+					logger.Result("OLLAMA LLM", pkg.Name, string(codeResult.Verdict))
 					if codeResult.Verdict == ollama.VerdictHold {
 						row.Overall = "HOLD"
 					} else if codeResult.Verdict == ollama.VerdictReview && row.Overall != "MALICIOUS" {

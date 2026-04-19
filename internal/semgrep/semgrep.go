@@ -10,7 +10,8 @@ import (
 
 // Runner handles Semgrep execution
 type Runner struct {
-	semgrepPath string
+	semgrepPath     string
+	customRulesPath string // Path to custom bsau-malware.yaml rules
 }
 
 // Finding represents a single Semgrep finding
@@ -65,36 +66,81 @@ func NewRunner() (*Runner, error) {
 		return nil, fmt.Errorf("semgrep not found in PATH: %w", err)
 	}
 
-	return &Runner{
+	runner := &Runner{
 		semgrepPath: path,
+	}
+
+	// Look for custom rules in the binary directory
+	exe, err := os.Executable()
+	if err == nil {
+		exe, err = filepath.EvalSymlinks(exe)
+		if err == nil {
+			rulesPath := filepath.Join(filepath.Dir(exe), "rules", "bsau-malware.yaml")
+			if _, err := os.Stat(rulesPath); err == nil {
+				runner.customRulesPath = rulesPath
+			}
+		}
+	}
+
+	return runner, nil
+}
+
+// NewRunnerWithRules creates a new Semgrep runner with a specific rules path
+func NewRunnerWithRules(rulesPath string) (*Runner, error) {
+	path, err := exec.LookPath("semgrep")
+	if err != nil {
+		return nil, fmt.Errorf("semgrep not found in PATH: %w", err)
+	}
+
+	return &Runner{
+		semgrepPath:     path,
+		customRulesPath: rulesPath,
 	}, nil
+}
+
+// HasCustomRules returns true if custom rules are available
+func (r *Runner) HasCustomRules() bool {
+	return r.customRulesPath != ""
 }
 
 // Update is a no-op - Semgrep auto-downloads rules when using remote configs
 // The --update flag was deprecated in newer Semgrep versions
 func (r *Runner) Update() error {
 	// Rules are automatically downloaded when scanning with remote configs
-	// like p/supply-chain, p/secrets, p/malicious-code
+	// Custom rules from bsau-malware.yaml are used when available
 	return nil
 }
 
-// ScanDirectory runs Semgrep against a directory using malicious code rule sets only
-// Per the spec: p/supply-chain, p/secrets, p/malicious-code - NOT vulnerability rules
+// ScanDirectory runs Semgrep against a directory using malicious code rule sets
+// Uses custom bsau-malware.yaml rules if available, otherwise falls back to remote configs
 func (r *Runner) ScanDirectory(dir string) (*ScanResult, error) {
 	// Verify directory exists
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		return nil, fmt.Errorf("directory does not exist: %s", dir)
 	}
 
-	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
-	cmd := exec.Command(r.semgrepPath,
-		"--config=p/supply-chain",
-		"--config=p/secrets",
-		"--config=p/malicious-code",
+	// Build command args
+	args := []string{}
+
+	if r.customRulesPath != "" {
+		// Use custom rules
+		args = append(args, "--config="+r.customRulesPath)
+	} else {
+		// Fall back to remote configs
+		args = append(args,
+			"--config=p/supply-chain",
+			"--config=p/secrets",
+		)
+	}
+
+	args = append(args,
 		"--json",
 		"--no-git-ignore", // Scan all files
 		dir,
 	)
+
+	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+	cmd := exec.Command(r.semgrepPath, args...)
 
 	output, err := cmd.Output()
 	if err != nil {

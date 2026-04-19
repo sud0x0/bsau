@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"time"
@@ -151,6 +153,7 @@ func (c *Client) CheckAvailability() error {
 }
 
 // AnalyzeFormula analyzes formula versions for security issues (Step 3)
+// Generates a diff between CURRENT and PREVIOUS versions and sends to Ollama
 func (c *Client) AnalyzeFormula(pkg string, versions []FormulaVersion) (*FormulaAnalysisResult, error) {
 	result := &FormulaAnalysisResult{Package: pkg}
 
@@ -159,23 +162,57 @@ func (c *Client) AnalyzeFormula(pkg string, versions []FormulaVersion) (*Formula
 		return result, nil
 	}
 
-	// Build the content with all formula versions
-	var content strings.Builder
-	fmt.Fprintf(&content, "Package: %s\n\n", pkg)
-
-	for _, v := range versions {
-		fmt.Fprintf(&content, "=== %s ===\n", v.Label)
-		if v.SHA != "" {
-			fmt.Fprintf(&content, "Git SHA: %s\n", v.SHA)
-		}
+	// If only one version, we can't diff - just note it's new
+	if len(versions) == 1 {
+		var content strings.Builder
+		fmt.Fprintf(&content, "Package: %s\n", pkg)
+		fmt.Fprintf(&content, "Note: This is a new formula with no previous version to compare.\n\n")
 		content.WriteString("```ruby\n")
-		content.WriteString(v.Content)
-		content.WriteString("\n```\n\n")
+		content.WriteString(versions[0].Content)
+		content.WriteString("\n```\n")
+
+		userPrompt := UserPromptFormulaAnalysis + "\n\n" + content.String()
+
+		response, err := c.sendChatRequest(FormulaSystemPrompt, userPrompt)
+		if err != nil {
+			result.Error = err
+			result.Verdict = VerdictReview
+			return result, nil
+		}
+
+		result.RawResponse = response
+		c.parseResponse(response, result)
+		return result, nil
 	}
+
+	// Generate diff between CURRENT (index 0) and PREVIOUS (index 1)
+	diff, err := generateFormulaDiff(versions[1].Content, versions[0].Content, pkg)
+	if err != nil {
+		result.Error = fmt.Errorf("generating diff: %w", err)
+		result.Verdict = VerdictReview
+		return result, nil
+	}
+
+	// If no diff, formula hasn't changed
+	if diff == "" {
+		result.Verdict = VerdictSafe
+		result.RawResponse = "No changes detected between versions"
+		return result, nil
+	}
+
+	// Build the content with the diff
+	var content strings.Builder
+	fmt.Fprintf(&content, "Package: %s\n", pkg)
+	if versions[1].SHA != "" && versions[0].SHA != "" {
+		fmt.Fprintf(&content, "Comparing: %s (PREVIOUS) → %s (CURRENT)\n\n", versions[1].SHA, versions[0].SHA)
+	}
+	content.WriteString("```diff\n")
+	content.WriteString(diff)
+	content.WriteString("\n```\n")
 
 	userPrompt := UserPromptFormulaAnalysis + "\n\n" + content.String()
 
-	response, err := c.sendChatRequest(SystemPrompt, userPrompt)
+	response, err := c.sendChatRequest(FormulaSystemPrompt, userPrompt)
 	if err != nil {
 		result.Error = err
 		result.Verdict = VerdictReview
@@ -188,7 +225,60 @@ func (c *Client) AnalyzeFormula(pkg string, versions []FormulaVersion) (*Formula
 	return result, nil
 }
 
+// generateFormulaDiff creates a unified diff between two formula contents
+func generateFormulaDiff(oldContent, newContent, pkg string) (string, error) {
+	// Create temp files for diff
+	oldFile, err := os.CreateTemp("", "formula-old-*.rb")
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = os.Remove(oldFile.Name()) }()
+
+	newFile, err := os.CreateTemp("", "formula-new-*.rb")
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = os.Remove(newFile.Name()) }()
+
+	if _, err := oldFile.WriteString(oldContent); err != nil {
+		return "", err
+	}
+	_ = oldFile.Close()
+
+	if _, err := newFile.WriteString(newContent); err != nil {
+		return "", err
+	}
+	_ = newFile.Close()
+
+	// Run diff -u
+	cmd := exec.Command("diff", "-u",
+		"--label", fmt.Sprintf("%s (PREVIOUS)", pkg),
+		"--label", fmt.Sprintf("%s (CURRENT)", pkg),
+		oldFile.Name(), newFile.Name())
+	output, err := cmd.Output()
+
+	// diff returns exit code 1 when files differ - that's expected
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if exitErr.ExitCode() == 1 {
+				return string(output), nil
+			}
+		}
+		return "", err
+	}
+
+	// Exit code 0 means no difference
+	return "", nil
+}
+
+// DiffChunkSize is the max lines per diff chunk (smaller than file chunks for better context)
+const DiffChunkSize = 200
+
+// DiffChunkOverlap is the overlap between diff chunks to maintain context
+const DiffChunkOverlap = 20
+
 // AnalyzeCode analyzes post-install code diff and Semgrep findings (Step 6a)
+// Large diffs are chunked to prevent context overflow in the LLM
 func (c *Client) AnalyzeCode(pkg, oldVersion, newVersion, diff, semgrepFindings string) (*CodeAnalysisResult, error) {
 	result := &CodeAnalysisResult{
 		Package:    pkg,
@@ -201,11 +291,62 @@ func (c *Client) AnalyzeCode(pkg, oldVersion, newVersion, diff, semgrepFindings 
 		return result, nil
 	}
 
-	// Build user content
+	// Chunk large diffs to prevent LLM context overflow
+	diffLines := strings.Split(diff, "\n")
+	if len(diffLines) <= DiffChunkSize {
+		// Small diff - analyze in one request
+		return c.analyzeDiffChunk(pkg, oldVersion, newVersion, diff, semgrepFindings, 0, len(diffLines), result)
+	}
+
+	// Large diff - chunk and aggregate results
+	var allFindings []Finding
+	worstVerdict := VerdictSafe
+	var allResponses strings.Builder
+
+	chunks := chunkDiff(diffLines)
+	for i, chunk := range chunks {
+		startLine := i*(DiffChunkSize-DiffChunkOverlap) + 1
+		endLine := startLine + len(strings.Split(chunk, "\n")) - 1
+
+		chunkResult := &CodeAnalysisResult{
+			Package:    pkg,
+			OldVersion: oldVersion,
+			NewVersion: newVersion,
+		}
+
+		_, err := c.analyzeDiffChunk(pkg, oldVersion, newVersion, chunk, semgrepFindings, startLine, endLine, chunkResult)
+		if err != nil {
+			continue
+		}
+
+		fmt.Fprintf(&allResponses, "--- Chunk %d (lines %d-%d) ---\n", i+1, startLine, endLine)
+		allResponses.WriteString(chunkResult.RawResponse)
+		allResponses.WriteString("\n\n")
+
+		allFindings = append(allFindings, chunkResult.Findings...)
+
+		if verdictPriority(chunkResult.Verdict) > verdictPriority(worstVerdict) {
+			worstVerdict = chunkResult.Verdict
+		}
+	}
+
+	result.Verdict = worstVerdict
+	result.Findings = allFindings
+	result.RawResponse = allResponses.String()
+
+	return result, nil
+}
+
+// analyzeDiffChunk analyzes a single chunk of diff
+func (c *Client) analyzeDiffChunk(pkg, oldVersion, newVersion, diffChunk, semgrepFindings string, startLine, endLine int, result *CodeAnalysisResult) (*CodeAnalysisResult, error) {
 	var content strings.Builder
 	fmt.Fprintf(&content, "Package: %s\n", pkg)
 	fmt.Fprintf(&content, "Upgraded: %s → %s\n", oldVersion, newVersion)
 	fmt.Fprintf(&content, "Installed path: /opt/homebrew/Cellar/%s/%s/\n\n", pkg, newVersion)
+
+	if startLine > 1 || endLine > DiffChunkSize {
+		fmt.Fprintf(&content, "Diff chunk (lines %d-%d of larger diff):\n", startLine, endLine)
+	}
 
 	if semgrepFindings != "" && semgrepFindings != "None" {
 		content.WriteString("Semgrep findings:\n")
@@ -214,22 +355,52 @@ func (c *Client) AnalyzeCode(pkg, oldVersion, newVersion, diff, semgrepFindings 
 	}
 
 	content.WriteString("Diff:\n```diff\n")
-	content.WriteString(diff)
+	content.WriteString(diffChunk)
 	content.WriteString("\n```")
 
 	userPrompt := UserPromptDiffAnalysis + "\n\n" + content.String()
 
-	response, err := c.sendChatRequest(SystemPrompt, userPrompt)
+	response, err := c.sendChatRequest(DiffSystemPrompt, userPrompt)
 	if err != nil {
 		result.Error = err
 		result.Verdict = VerdictReview
-		return result, nil
+		return result, err
 	}
 
 	result.RawResponse = response
 	c.parseCodeResponse(response, result)
 
 	return result, nil
+}
+
+// chunkDiff splits diff content into chunks with overlap
+func chunkDiff(lines []string) []string {
+	totalLines := len(lines)
+
+	if totalLines <= DiffChunkSize {
+		return []string{strings.Join(lines, "\n")}
+	}
+
+	var chunks []string
+	start := 0
+
+	for start < totalLines {
+		end := start + DiffChunkSize
+		if end > totalLines {
+			end = totalLines
+		}
+
+		chunk := strings.Join(lines[start:end], "\n")
+		chunks = append(chunks, chunk)
+
+		if end >= totalLines {
+			break
+		}
+
+		start = end - DiffChunkOverlap
+	}
+
+	return chunks
 }
 
 // AnalyzeFiles analyzes file contents using chunking (for inspect command)

@@ -43,6 +43,7 @@ bsau performs multiple layers of security analysis before and after every upgrad
 1. **Vulnerability Scanning** - Uses OSV.dev and NIST NVD for comprehensive CVE detection
 2. **Static Analysis** - Semgrep scans with supply-chain, secrets, and malicious-code rule sets
 3. **Local LLM Analysis** - Analyzes formula files and code diffs for suspicious patterns
+4. **Detailed Reports** - Generates timestamped report files with vulnerability details and per-package scan results
 
 ## Workflow (7 Steps)
 
@@ -58,8 +59,8 @@ bsau performs multiple layers of security analysis before and after every upgrad
 
 1. **No static binary scanning**: bsau does not perform static analysis or hash verification on compiled binaries. Semgrep and local LLM analyse source/script files only. Compiled executables, libraries, and object files are not scanned for malware signatures or suspicious patterns.
 2. **Binary-only casks**: Closed-source GUI applications have no formula source to analyze. Local LLM analysis is not meaningful for these.
-3. **OSV coverage**: bsau uses embedded package mappings to query OSV.dev and NIST NVD. `N/A` means no mapping exists for that package.
-4. **Semgrep pattern matching**: Semgrep detects known malicious patterns (`p/supply-chain`, `p/secrets`, `p/malicious-code`). Novel or heavily obfuscated attacks may evade signature-based detection.
+3. **Vulnerability database coverage**: bsau only queries OSV.dev and NIST NVD for vulnerabilities. Additional vulnerabilities may exist in other databases (e.g., GitHub Security Advisories, vendor-specific advisories, or security mailing lists) that are not checked. CVE counts shown may be incomplete or inaccurate. `N/A` means no mapping exists for that package.
+4. **Semgrep pattern matching**: Semgrep uses custom `bsau-malware.yaml` rules to detect malicious patterns (C2 IPs, reverse shells, credential harvesting, persistence mechanisms, etc.). Falls back to `p/supply-chain` and `p/secrets` if custom rules aren't available. Novel or heavily obfuscated attacks may evade signature-based detection.
 5. **LLM context window**: Large formula files are truncated at `ollama_max_file_bytes` (default 12KB). Truncation is noted in findings but malicious code beyond the limit won't be analyzed.
 6. **Snapshot disk usage**: Pre-upgrade snapshots of text files may consume significant `/tmp` space for large packages. bsau warns when space is low and skips snapshots if critically low.
 7. **No transitive dependency scanning**: Only Homebrew-level packages are scanned, not runtime dependencies (e.g., Python packages inside a formula's venv).
@@ -170,13 +171,29 @@ features:
 # LLM model to use (REQUIRED when ollama_scan is enabled)
 # Run 'ollama list' to see available models
 # No default - you must specify a model
-ollama_model: gemma3  # or llama3, mistral, etc.
+ollama_model: gemma4:e2b  # or llama3, mistral, etc.
 ```
 
 Make sure Ollama is running if `ollama_scan` is enabled:
 
 ```bash
 ollama serve   # Start Ollama server
+```
+
+> **⚠️ Performance Note:** If the Ollama server does not have adequate resources (CPU/GPU/RAM), scans will take significantly longer. Each file chunk can take 30-60+ seconds. For best performance, use a machine with a dedicated GPU or Apple Silicon.
+
+Test Ollama connectivity:
+
+```bash
+curl http://10.211.55.41:11434/api/chat -d '{
+  "model": "gemma4:e2b",
+  "messages": [{
+    "role": "user",
+    "content": "How many letter r are in strawberry?"
+  }],
+  "think": false,
+  "stream": false
+}' -v
 ```
 
 **File Locations**: `settings.yaml` is stored in the same directory as the bsau binary. This makes the tool self-contained and easy to move.
@@ -193,10 +210,14 @@ ollama serve   # Start Ollama server
 
 ## Step 2: Package Selection
 
+- Creates a vulnerability report file in the binary directory: `bsau_report_YYYY-MM-DD_<unix_timestamp>.txt`
+- Displays the report file location for reference
 - Displays a table showing: Package, Current Version, Available Version, Pinned Status, CVE Count, Severity
 - Warns about pinned packages with known CVEs (but does not offer to update them)
 - Interactive selector allows choosing which packages to update
 - Dependency awareness: shows which packages depend on each other
+
+> **⚠️ Limitation:** CVE data is sourced from OSV.dev and NIST NVD only. Additional vulnerabilities may exist in other databases (GitHub Security Advisories, vendor advisories, security mailing lists) that are not checked. CVE counts may be incomplete.
 
 ## Step 3: Pre-install Security Scan
 
@@ -227,7 +248,8 @@ ollama serve   # Start Ollama server
 ## Step 6: Post-install Verification
 
 **6a. Semgrep Scan**
-- Runs with `p/supply-chain`, `p/secrets`, `p/malicious-code` rule sets (auto-downloaded)
+- Runs with custom `rules/bsau-malware.yaml` rules designed for malware detection
+- Detects: hardcoded IPs, reverse shells, credential harvesting, base64 decode + exec, persistence mechanisms, security bypasses
 - Parses JSON output for flagged files and line numbers
 
 **6b. Diff Generation**
@@ -247,9 +269,15 @@ ollama serve   # Start Ollama server
 
 - Re-runs vulnerability scan on updated packages
 - Displays before/after CVE summary
-- Shows post-update security summary table
 - Removes temporary run directory (`/tmp/bsau-<run-id>/`)
 - Runs `brew cleanup` to remove old versions
+- Writes final summary to report file and displays:
+  - Packages updated vs not updated (with CVE counts)
+  - Per-package scan results table showing status of:
+    - Formula LLM analysis (SAFE/REVIEW/HOLD/skipped/failed)
+    - Semgrep scan (clean/X findings/skipped/failed)
+    - Code LLM analysis (SAFE/REVIEW/HOLD/skipped/failed)
+- Displays path to the full report file
 
 # Development Setup
 

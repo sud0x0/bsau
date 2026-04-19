@@ -30,22 +30,23 @@ type OutdatedPackage struct {
 	InstalledVersion string `json:"installed_version"`
 	CurrentVersion   string `json:"current_version"`
 	Pinned           bool   `json:"pinned"`
-	SourceURL        string `json:"source_url,omitempty"` // URL for ecosystem detection
 }
 
 // Client provides Homebrew interaction methods
 type Client struct {
-	homebrewPath string
-	brewPath     string
-	repoPath     string
+	homebrewPath  string
+	brewPath      string
+	repoPath      string
+	githubFetcher *GitHubFetcher
 }
 
 // NewClient creates a new Homebrew client
 func NewClient(homebrewPath string) *Client {
 	brewPath := filepath.Join(homebrewPath, "bin", "brew")
 	return &Client{
-		homebrewPath: homebrewPath,
-		brewPath:     brewPath,
+		homebrewPath:  homebrewPath,
+		brewPath:      brewPath,
+		githubFetcher: NewGitHubFetcher(),
 	}
 }
 
@@ -73,14 +74,20 @@ func (c *Client) GetFormulaPath(pkg string) (string, error) {
 		return "", err
 	}
 
-	// Formula location: Library/Taps/homebrew/homebrew-core/Formula/<first-letter>/<name>.rb
-	firstLetter := strings.ToLower(pkg[:1])
+	// Formula location: Library/Taps/homebrew/homebrew-core/Formula/<prefix>/<name>.rb
+	// Prefix is usually first letter, but packages starting with "lib" use "lib" as prefix
+	prefix := strings.ToLower(pkg[:1])
+	if strings.HasPrefix(strings.ToLower(pkg), "lib") && len(pkg) > 3 {
+		prefix = "lib"
+	}
+
 	formulaPath := filepath.Join(repo, "Library", "Taps", "homebrew", "homebrew-core",
-		"Formula", firstLetter, pkg+".rb")
+		"Formula", prefix, pkg+".rb")
 
 	if _, err := os.Stat(formulaPath); os.IsNotExist(err) {
-		// Try alternate locations
+		// Try alternate locations including first letter if lib prefix didn't work
 		altPaths := []string{
+			filepath.Join(repo, "Library", "Taps", "homebrew", "homebrew-core", "Formula", strings.ToLower(pkg[:1]), pkg+".rb"),
 			filepath.Join(repo, "Library", "Taps", "homebrew", "homebrew-core", "Formula", pkg+".rb"),
 			filepath.Join(repo, "Library", "Formula", pkg+".rb"),
 		}
@@ -95,10 +102,15 @@ func (c *Client) GetFormulaPath(pkg string) (string, error) {
 	return formulaPath, nil
 }
 
-// GetFormulaVersions retrieves the last 3 versions of a formula from git history
+// GetFormulaVersions retrieves the last 2 versions of a formula from git history (CURRENT and PREVIOUS)
+// Falls back to GitHub API if local homebrew-core tap is not available
 func (c *Client) GetFormulaVersions(pkg string) ([]ollama.FormulaVersion, error) {
 	formulaPath, err := c.GetFormulaPath(pkg)
 	if err != nil {
+		// Local formula not found - try GitHub fallback
+		if c.githubFetcher != nil {
+			return c.githubFetcher.GetFormulaVersions(pkg)
+		}
 		return nil, err
 	}
 
@@ -110,14 +122,23 @@ func (c *Client) GetFormulaVersions(pkg string) ([]ollama.FormulaVersion, error)
 	// Get the homebrew-core tap directory
 	tapDir := filepath.Join(repo, "Library", "Taps", "homebrew", "homebrew-core")
 
+	// Check if tap directory exists (API-only mode won't have it)
+	if _, err := os.Stat(tapDir); os.IsNotExist(err) {
+		// Tap not cloned - use GitHub fallback
+		if c.githubFetcher != nil {
+			return c.githubFetcher.GetFormulaVersions(pkg)
+		}
+		return nil, fmt.Errorf("homebrew-core tap not available and GitHub fallback disabled")
+	}
+
 	// Get relative path within the tap
 	relPath, err := filepath.Rel(tapDir, formulaPath)
 	if err != nil {
 		return nil, fmt.Errorf("getting relative path: %w", err)
 	}
 
-	// Get last 3 commits that touched this formula
-	cmd := exec.Command("git", "-C", tapDir, "log", "--oneline", "-3", "--", relPath)
+	// Get last 2 commits that touched this formula (CURRENT and PREVIOUS)
+	cmd := exec.Command("git", "-C", tapDir, "log", "--oneline", "-2", "--", relPath)
 	output, err := cmd.Output()
 	if err != nil {
 		// If git history not available, just read current version
@@ -143,11 +164,11 @@ func (c *Client) GetFormulaVersions(pkg string) ([]ollama.FormulaVersion, error)
 		}}, nil
 	}
 
-	labels := []string{"CURRENT", "PREVIOUS", "TWO_VERSIONS_AGO"}
+	labels := []string{"CURRENT", "PREVIOUS"}
 	versions := make([]ollama.FormulaVersion, 0, len(lines))
 
 	for i, line := range lines {
-		if i >= 3 {
+		if i >= 2 {
 			break
 		}
 
