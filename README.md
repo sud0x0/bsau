@@ -456,6 +456,7 @@ bsau/
 
 # TODO
 
+- Better yara rules
 - Premature packages scanning (N+2)
 - Specific version installation support
 - Tap verification
