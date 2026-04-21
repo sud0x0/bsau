@@ -149,22 +149,62 @@ bsau run --dry-run
 
 ## Commands
 
+### Main Commands
+
 | Command | Description |
 |---------|-------------|
 | `bsau run` | Full scan and update workflow |
-| `bsau run --dry-run` | Run scans, show results, skip upgrades |
-| `bsau run --no-yara` | Skip YARA scan for this run |
-| `bsau run --no-ollama` | Skip LLM analysis for this run |
-| `bsau inspect` | Show inspect help menu |
-| `bsau inspect <package>` | Scan a specific package |
+| `bsau inspect <package>` | Scan a specific installed package |
 | `bsau inspect --all` | Scan all installed packages |
-| `bsau inspect ... --no-vuln` | Skip vulnerability scan |
-| `bsau inspect ... --no-yara` | Skip YARA scan |
-| `bsau inspect ... --no-ollama` | Skip LLM analysis |
-| `bsau init` | Generate default config file in binary directory |
+| `bsau init` | Generate default config file |
 | `bsau version` | Show version info |
+| `bsau help` | Show help |
 
-> **Note:** On first run, bsau automatically generates a default `settings.yaml` config file in the binary directory. By default, inspect runs all checks: vulnerability scan, YARA, and LLM (if enabled in config).
+### Run Flags
+
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Run all scans but skip the actual upgrade |
+| `--no-llm` | Skip LLM analysis for this run |
+| `--no-yara` | Skip YARA scan for this run |
+| `-v, --verbose` | Enable verbose output (shows LLM requests/responses) |
+
+### Inspect Flags
+
+| Flag | Description |
+|------|-------------|
+| `--all` | Scan all installed packages (required if no package specified) |
+| `--no-vuln` | Skip vulnerability scan (OSV/NVD) |
+| `--no-yara` | Skip YARA malware scan |
+| `--no-llm` | Skip LLM code analysis |
+| `-v, --verbose` | Enable verbose output |
+
+### Examples
+
+```bash
+# Full workflow with all scans
+bsau run
+
+# Dry run - see what would happen without upgrading
+bsau run --dry-run
+
+# Skip LLM (faster, still runs vuln + YARA)
+bsau run --no-llm
+
+# Verbose mode - see LLM requests/responses
+bsau run -v
+
+# Scan a specific package
+bsau inspect wget
+
+# Scan all packages with just YARA (fast)
+bsau inspect --all --no-vuln --no-llm
+
+# Full scan of all packages
+bsau inspect --all
+```
+
+> **Note:** On first run, bsau automatically generates a default `settings.yaml` config file in the binary directory.
 
 > **CTRL+C Handling**: During upgrades or scans, pressing CTRL+C will prompt you to confirm before exiting. This prevents accidental interruption that could leave temp files behind. If you confirm exit, bsau cleans up gracefully.
 
@@ -416,7 +456,10 @@ bsau/
 
 # TODO
 
+- Premature packages scanning (N+2)
+- Specific version installation support
 - Tap verification
-- Binary signing verification
+- Binary signing verification (where possible)
 - Transitive dependency scanning
 - Network monitoring during install
+
