@@ -17,7 +17,7 @@ type RunState struct {
 	RunDir         string                 `json:"run_dir"`
 	PreUpdateVulns map[string]interface{} `json:"pre_update_vulns"`
 	ScanResults    map[string]interface{} `json:"scan_results"`
-	SemgrepResults map[string]interface{} `json:"semgrep_results"`
+	YaraResults    map[string]interface{} `json:"yara_results"`
 }
 
 // VTDailyState tracks VirusTotal API usage across runs
@@ -84,9 +84,9 @@ func (m *RunManager) SaveScanResults(data map[string]interface{}) error {
 	return m.saveJSON("scan-results.json", data)
 }
 
-// SaveSemgrepResults saves Semgrep findings
-func (m *RunManager) SaveSemgrepResults(data map[string]interface{}) error {
-	return m.saveJSON("semgrep-results.json", data)
+// SaveYaraResults saves YARA findings
+func (m *RunManager) SaveYaraResults(data map[string]interface{}) error {
+	return m.saveJSON("yara-results.json", data)
 }
 
 func (m *RunManager) saveJSON(filename string, data interface{}) error {

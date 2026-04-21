@@ -1,4 +1,4 @@
-.PHONY: build clean test test-pretty lint fmt vet help pre-commit-run vulncheck semgrep socket
+.PHONY: build clean test test-pretty lint fmt vet help pre-commit-run vulncheck semgrep socket check-yara
 
 BINARY := bsau
 BUILD_DIR := _BUILD_
@@ -6,17 +6,26 @@ VERSION := 0.1.0
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 LDFLAGS := -ldflags "-X github.com/sud0x0/bsau/cmd.Version=$(VERSION) -X github.com/sud0x0/bsau/cmd.GitCommit=$(GIT_COMMIT) -X github.com/sud0x0/bsau/cmd.BuildDate=$(BUILD_DATE)"
+YARA_PREFIX     ?= $(shell brew --prefix yara 2>/dev/null)
+CGO_YARA_FLAGS  := CGO_CFLAGS="-I$(YARA_PREFIX)/include" CGO_LDFLAGS="-L$(YARA_PREFIX)/lib"
 
 # Build the binary
 build:
-	@mkdir -p $(BUILD_DIR)/rules
-	@go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY) .
-	@cp -r rules/* $(BUILD_DIR)/rules/ 2>/dev/null || true
+	@mkdir -p $(BUILD_DIR)
+	@$(CGO_YARA_FLAGS) go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY) .
 
 # Remove binary and clean build cache
 clean:
 	@rm -rf $(BUILD_DIR) _test_results_
 	@go clean
+
+# Verify libyara is installed (required for building)
+check-yara:
+	@brew list yara >/dev/null 2>&1 || { \
+		echo "Error: yara not installed."; \
+		echo "Run: brew install yara"; \
+		exit 1; \
+	}
 
 # Run all tests
 test:
@@ -61,7 +70,8 @@ help:
 	@echo "Usage: make [target]"
 	@echo ""
 	@echo "Build targets:"
-	@echo "  build          Build the binary"
+	@echo "  build          Build the binary (requires brew install yara)"
+	@echo "  check-yara     Verify libyara is installed (brew install yara)"
 	@echo "  clean          Remove binary and clean build cache"
 	@echo ""
 	@echo "Test targets:"

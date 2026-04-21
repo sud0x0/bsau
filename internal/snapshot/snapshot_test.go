@@ -192,3 +192,103 @@ func TestCheckDiskSpace(t *testing.T) {
 		t.Error("expected CanProceed to be true for small file")
 	}
 }
+
+func TestChangedFiles(t *testing.T) {
+	tests := []struct {
+		name     string
+		diff     string
+		newPath  string
+		expected []string
+	}{
+		{
+			name:     "empty diff returns empty slice",
+			diff:     "",
+			newPath:  "/opt/homebrew/Cellar/pkg/2.0.0",
+			expected: []string{},
+		},
+		{
+			name: "single modified file",
+			diff: `--- /tmp/bsau-123/snapshots/pkg/1.0.0/lib/file.rb	2024-01-01 12:00:00.000000000 +0000
++++ /opt/homebrew/Cellar/pkg/2.0.0/lib/file.rb	2024-01-02 12:00:00.000000000 +0000
+@@ -1,3 +1,4 @@
+ line1
++new line
+ line2`,
+			newPath:  "/opt/homebrew/Cellar/pkg/2.0.0",
+			expected: []string{"/opt/homebrew/Cellar/pkg/2.0.0/lib/file.rb"},
+		},
+		{
+			name: "deleted file shows as /dev/null and is skipped",
+			diff: `--- /tmp/bsau-123/snapshots/pkg/1.0.0/lib/deleted.rb	2024-01-01 12:00:00.000000000 +0000
++++ /dev/null	2024-01-02 12:00:00.000000000 +0000
+@@ -1,3 +0,0 @@
+-line1
+-line2`,
+			newPath:  "/opt/homebrew/Cellar/pkg/2.0.0",
+			expected: []string{},
+		},
+		{
+			name: "new file (added)",
+			diff: `--- /dev/null	2024-01-01 12:00:00.000000000 +0000
++++ /opt/homebrew/Cellar/pkg/2.0.0/lib/new.rb	2024-01-02 12:00:00.000000000 +0000
+@@ -0,0 +1,3 @@
++line1
++line2`,
+			newPath:  "/opt/homebrew/Cellar/pkg/2.0.0",
+			expected: []string{"/opt/homebrew/Cellar/pkg/2.0.0/lib/new.rb"},
+		},
+		{
+			name: "multiple files with one deleted",
+			diff: `--- /tmp/bsau-123/snapshots/pkg/1.0.0/lib/modified.rb	2024-01-01 12:00:00.000000000 +0000
++++ /opt/homebrew/Cellar/pkg/2.0.0/lib/modified.rb	2024-01-02 12:00:00.000000000 +0000
+@@ -1,3 +1,4 @@
+ line1
++new
+--- /tmp/bsau-123/snapshots/pkg/1.0.0/lib/deleted.rb	2024-01-01 12:00:00.000000000 +0000
++++ /dev/null	2024-01-02 12:00:00.000000000 +0000
+@@ -1,3 +0,0 @@
+-gone
+--- /dev/null	2024-01-01 12:00:00.000000000 +0000
++++ /opt/homebrew/Cellar/pkg/2.0.0/lib/added.rb	2024-01-02 12:00:00.000000000 +0000
+@@ -0,0 +1,3 @@
++new file`,
+			newPath: "/opt/homebrew/Cellar/pkg/2.0.0",
+			expected: []string{
+				"/opt/homebrew/Cellar/pkg/2.0.0/lib/modified.rb",
+				"/opt/homebrew/Cellar/pkg/2.0.0/lib/added.rb",
+			},
+		},
+		{
+			name: "no duplicates",
+			diff: `--- a	2024-01-01 12:00:00.000000000 +0000
++++ /opt/homebrew/Cellar/pkg/2.0.0/lib/file.rb	2024-01-02 12:00:00.000000000 +0000
+@@ -1 +1 @@
+-old
++new
+--- b	2024-01-01 12:00:00.000000000 +0000
++++ /opt/homebrew/Cellar/pkg/2.0.0/lib/file.rb	2024-01-02 12:00:00.000000000 +0000
+@@ -1 +1 @@
+-old2
++new2`,
+			newPath:  "/opt/homebrew/Cellar/pkg/2.0.0",
+			expected: []string{"/opt/homebrew/Cellar/pkg/2.0.0/lib/file.rb"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ChangedFiles(tt.diff, tt.newPath)
+			if len(result) != len(tt.expected) {
+				t.Errorf("ChangedFiles() returned %d files, expected %d", len(result), len(tt.expected))
+				t.Errorf("Got: %v", result)
+				t.Errorf("Expected: %v", tt.expected)
+				return
+			}
+			for i, path := range result {
+				if path != tt.expected[i] {
+					t.Errorf("ChangedFiles()[%d] = %s, expected %s", i, path, tt.expected[i])
+				}
+			}
+		})
+	}
+}

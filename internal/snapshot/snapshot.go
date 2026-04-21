@@ -181,6 +181,50 @@ func (m *Manager) Cleanup(pkg string) error {
 	return os.RemoveAll(pkgDir)
 }
 
+// ChangedFiles parses a unified diff string (from diff -ru) and returns
+// absolute paths of files that were added or modified in newPath.
+// Deleted files (/dev/null) are excluded since they no longer exist on disk.
+func ChangedFiles(diff, newPath string) []string {
+	if diff == "" {
+		return []string{}
+	}
+
+	var files []string
+	seen := make(map[string]bool)
+
+	lines := strings.Split(diff, "\n")
+	for _, line := range lines {
+		// Look for +++ headers which indicate the destination file
+		if !strings.HasPrefix(line, "+++ ") {
+			continue
+		}
+
+		// Extract path after "+++ "
+		path := strings.TrimPrefix(line, "+++ ")
+
+		// Remove timestamp suffix if present (diff -ru adds timestamps)
+		// Format: "+++ /path/to/file\t2024-01-01 12:00:00.000000000 +0000"
+		if idx := strings.Index(path, "\t"); idx != -1 {
+			path = path[:idx]
+		}
+
+		// Skip deleted files (they show as /dev/null in the +++ line)
+		if path == "/dev/null" {
+			continue
+		}
+
+		// Avoid duplicates
+		if seen[path] {
+			continue
+		}
+		seen[path] = true
+
+		files = append(files, path)
+	}
+
+	return files
+}
+
 // IsTextFile checks if a file is text-readable (valid UTF-8)
 func IsTextFile(path string) bool {
 	// Check extension first for common cases

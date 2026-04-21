@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sud0x0/bsau/internal/ollama"
+	"github.com/sud0x0/bsau/internal/llm"
 )
 
 const (
@@ -27,9 +27,9 @@ const (
 
 // GitHubFetcher handles fetching formula content from GitHub when local files aren't available
 type GitHubFetcher struct {
-	httpClient   *http.Client
-	lastAPICall  time.Time
-	rateLimitMu  sync.Mutex
+	httpClient  *http.Client
+	lastAPICall time.Time
+	rateLimitMu sync.Mutex
 }
 
 // NewGitHubFetcher creates a new GitHub fetcher
@@ -154,7 +154,7 @@ func (g *GitHubFetcher) GetFormulaContent(rubySourcePath, sha string) (string, e
 }
 
 // GetFormulaVersions fetches the last 2 versions of a formula from GitHub (CURRENT and PREVIOUS)
-func (g *GitHubFetcher) GetFormulaVersions(pkg string) ([]ollama.FormulaVersion, error) {
+func (g *GitHubFetcher) GetFormulaVersions(pkg string) ([]llm.FormulaVersion, error) {
 	// Get the ruby_source_path from Homebrew API
 	rubySourcePath, err := g.GetFormulaPath(pkg)
 	if err != nil {
@@ -169,7 +169,7 @@ func (g *GitHubFetcher) GetFormulaVersions(pkg string) ([]ollama.FormulaVersion,
 		if contentErr != nil {
 			return nil, fmt.Errorf("getting formula versions: %w (commit history: %v)", contentErr, err)
 		}
-		return []ollama.FormulaVersion{{
+		return []llm.FormulaVersion{{
 			Label:   "CURRENT",
 			Content: content,
 		}}, nil
@@ -181,14 +181,14 @@ func (g *GitHubFetcher) GetFormulaVersions(pkg string) ([]ollama.FormulaVersion,
 		if err != nil {
 			return nil, err
 		}
-		return []ollama.FormulaVersion{{
+		return []llm.FormulaVersion{{
 			Label:   "CURRENT",
 			Content: content,
 		}}, nil
 	}
 
 	labels := []string{"CURRENT", "PREVIOUS"}
-	versions := make([]ollama.FormulaVersion, 0, len(shas))
+	versions := make([]llm.FormulaVersion, 0, len(shas))
 
 	for i, sha := range shas {
 		if i >= 2 {
@@ -200,7 +200,7 @@ func (g *GitHubFetcher) GetFormulaVersions(pkg string) ([]ollama.FormulaVersion,
 			continue
 		}
 
-		versions = append(versions, ollama.FormulaVersion{
+		versions = append(versions, llm.FormulaVersion{
 			Label:   labels[i],
 			SHA:     sha[:7], // Short SHA for display
 			Content: content,

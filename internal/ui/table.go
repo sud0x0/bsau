@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/olekukonko/tablewriter"
-	"github.com/sud0x0/bsau/internal/ollama"
+	"github.com/sud0x0/bsau/internal/llm"
 )
 
 // Color codes for terminal output
@@ -48,19 +48,19 @@ type PackageRow struct {
 type PreInstallRow struct {
 	Package        string
 	CVECount       int
-	OllamaVerdict  ollama.Verdict
+	LLMVerdict     llm.Verdict
 	Recommendation string
 }
 
 // PostInstallRow represents a row in the post-install summary (Step 6) and inspect results
 type PostInstallRow struct {
-	Package       string
-	Version       string
-	CVECount      int
-	Severity      Severity
-	SemgrepCount  int
-	OllamaVerdict ollama.Verdict
-	Overall       string
+	Package    string
+	Version    string
+	CVECount   int
+	Severity   Severity
+	YaraCount  int
+	LLMVerdict llm.Verdict
+	Overall    string
 }
 
 // RenderPackageTable displays the package status table (Step 2)
@@ -106,7 +106,7 @@ func RenderPackageTable(rows []PackageRow) {
 }
 
 // RenderPreInstallTable displays pre-install scan results (Step 4)
-func RenderPreInstallTable(rows []PreInstallRow, showOllama bool) {
+func RenderPreInstallTable(rows []PreInstallRow, showLLM bool) {
 	headers := []string{"Package", "CVEs", "Recommendation"}
 	alignments := []int{
 		tablewriter.ALIGN_LEFT,
@@ -114,8 +114,8 @@ func RenderPreInstallTable(rows []PreInstallRow, showOllama bool) {
 		tablewriter.ALIGN_LEFT,
 	}
 
-	if showOllama {
-		headers = []string{"Package", "CVEs", "Ollama Verdict", "Recommendation"}
+	if showLLM {
+		headers = []string{"Package", "CVEs", "LLM Verdict", "Recommendation"}
 		alignments = []int{
 			tablewriter.ALIGN_LEFT,
 			tablewriter.ALIGN_RIGHT,
@@ -137,8 +137,8 @@ func RenderPreInstallTable(rows []PreInstallRow, showOllama bool) {
 			fmt.Sprintf("%d", row.CVECount),
 		}
 
-		if showOllama {
-			cols = append(cols, colorVerdict(row.OllamaVerdict))
+		if showLLM {
+			cols = append(cols, colorVerdict(row.LLMVerdict))
 		}
 
 		cols = append(cols, colorRecommendation(row.Recommendation))
@@ -150,17 +150,17 @@ func RenderPreInstallTable(rows []PreInstallRow, showOllama bool) {
 
 // InspectTableOptions controls which columns to show in inspect results
 type InspectTableOptions struct {
-	ShowVuln    bool
-	ShowSemgrep bool
-	ShowOllama  bool
+	ShowVuln bool
+	ShowYara bool
+	ShowLLM  bool
 }
 
 // RenderPostInstallTable displays post-install summary (Step 6)
-func RenderPostInstallTable(rows []PostInstallRow, showOllama bool) {
+func RenderPostInstallTable(rows []PostInstallRow, showLLM bool) {
 	RenderInspectTable(rows, InspectTableOptions{
-		ShowVuln:    false,
-		ShowSemgrep: true,
-		ShowOllama:  showOllama,
+		ShowVuln: false,
+		ShowYara: true,
+		ShowLLM:  showLLM,
 	})
 }
 
@@ -174,13 +174,13 @@ func RenderInspectTable(rows []PostInstallRow, opts InspectTableOptions) {
 		alignments = append(alignments, tablewriter.ALIGN_LEFT, tablewriter.ALIGN_RIGHT, tablewriter.ALIGN_CENTER)
 	}
 
-	if opts.ShowSemgrep {
-		headers = append(headers, "Semgrep")
+	if opts.ShowYara {
+		headers = append(headers, "YARA")
 		alignments = append(alignments, tablewriter.ALIGN_RIGHT)
 	}
 
-	if opts.ShowOllama {
-		headers = append(headers, "Ollama")
+	if opts.ShowLLM {
+		headers = append(headers, "LLM")
 		alignments = append(alignments, tablewriter.ALIGN_CENTER)
 	}
 
@@ -205,12 +205,12 @@ func RenderInspectTable(rows []PostInstallRow, opts InspectTableOptions) {
 			cols = append(cols, row.Version, cves, colorSeverity(row.Severity))
 		}
 
-		if opts.ShowSemgrep {
-			cols = append(cols, fmt.Sprintf("%d", row.SemgrepCount))
+		if opts.ShowYara {
+			cols = append(cols, fmt.Sprintf("%d", row.YaraCount))
 		}
 
-		if opts.ShowOllama {
-			cols = append(cols, colorVerdict(row.OllamaVerdict))
+		if opts.ShowLLM {
+			cols = append(cols, colorVerdict(row.LLMVerdict))
 		}
 
 		cols = append(cols, colorOverall(row.Overall))
@@ -294,10 +294,18 @@ func NewProgress(prefix string, total int) *Progress {
 	}
 }
 
-// Update shows progress for the current item
+// Update increments counter and shows progress for the current item
 func (p *Progress) Update(item string) {
 	p.current++
 	// Clear line and print progress
+	fmt.Printf("\r%s[%d/%d]%s %s%-40s%s",
+		ColorCyan, p.current, p.total, ColorReset,
+		ColorYellow, truncate(item, 40), ColorReset)
+}
+
+// SetStatus updates the display without incrementing the counter
+// Use this for showing sub-steps within a single item
+func (p *Progress) SetStatus(item string) {
 	fmt.Printf("\r%s[%d/%d]%s %s%-40s%s",
 		ColorCyan, p.current, p.total, ColorReset,
 		ColorYellow, truncate(item, 40), ColorReset)
@@ -395,13 +403,13 @@ func colorSeverity(s Severity) string {
 	}
 }
 
-func colorVerdict(v ollama.Verdict) string {
+func colorVerdict(v llm.Verdict) string {
 	switch v {
-	case ollama.VerdictSafe:
+	case llm.VerdictSafe:
 		return ColorGreen + string(v) + ColorReset
-	case ollama.VerdictReview:
+	case llm.VerdictReview:
 		return ColorYellow + string(v) + ColorReset
-	case ollama.VerdictHold:
+	case llm.VerdictHold:
 		return ColorRed + string(v) + ColorReset
 	default:
 		return string(v)
@@ -439,7 +447,7 @@ func colorOverall(o string) string {
 // ScanFailure represents a failure during the workflow
 type ScanFailure struct {
 	Package string // Package name (empty for non-package-specific failures)
-	Step    string // Which step failed (e.g., "OSV Scan", "Semgrep")
+	Step    string // Which step failed (e.g., "OSV Scan", "YARA")
 	Error   string // Error message
 }
 

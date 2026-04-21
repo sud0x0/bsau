@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/sud0x0/bsau/internal/ollama"
+	"github.com/sud0x0/bsau/internal/llm"
 )
 
 // Package represents a Homebrew package
@@ -104,7 +104,7 @@ func (c *Client) GetFormulaPath(pkg string) (string, error) {
 
 // GetFormulaVersions retrieves the last 2 versions of a formula from git history (CURRENT and PREVIOUS)
 // Falls back to GitHub API if local homebrew-core tap is not available
-func (c *Client) GetFormulaVersions(pkg string) ([]ollama.FormulaVersion, error) {
+func (c *Client) GetFormulaVersions(pkg string) ([]llm.FormulaVersion, error) {
 	formulaPath, err := c.GetFormulaPath(pkg)
 	if err != nil {
 		// Local formula not found - try GitHub fallback
@@ -146,7 +146,7 @@ func (c *Client) GetFormulaVersions(pkg string) ([]ollama.FormulaVersion, error)
 		if err != nil {
 			return nil, fmt.Errorf("reading formula: %w", err)
 		}
-		return []ollama.FormulaVersion{{
+		return []llm.FormulaVersion{{
 			Label:   "CURRENT",
 			Content: string(content),
 		}}, nil
@@ -158,14 +158,14 @@ func (c *Client) GetFormulaVersions(pkg string) ([]ollama.FormulaVersion, error)
 		if err != nil {
 			return nil, fmt.Errorf("reading formula: %w", err)
 		}
-		return []ollama.FormulaVersion{{
+		return []llm.FormulaVersion{{
 			Label:   "CURRENT",
 			Content: string(content),
 		}}, nil
 	}
 
 	labels := []string{"CURRENT", "PREVIOUS"}
-	versions := make([]ollama.FormulaVersion, 0, len(lines))
+	versions := make([]llm.FormulaVersion, 0, len(lines))
 
 	for i, line := range lines {
 		if i >= 2 {
@@ -182,7 +182,7 @@ func (c *Client) GetFormulaVersions(pkg string) ([]ollama.FormulaVersion, error)
 			continue
 		}
 
-		versions = append(versions, ollama.FormulaVersion{
+		versions = append(versions, llm.FormulaVersion{
 			Label:   labels[i],
 			SHA:     sha,
 			Content: string(content),
@@ -195,7 +195,7 @@ func (c *Client) GetFormulaVersions(pkg string) ([]ollama.FormulaVersion, error)
 		if err != nil {
 			return nil, fmt.Errorf("reading formula: %w", err)
 		}
-		return []ollama.FormulaVersion{{
+		return []llm.FormulaVersion{{
 			Label:   "CURRENT",
 			Content: string(content),
 		}}, nil

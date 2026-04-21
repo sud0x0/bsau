@@ -13,6 +13,12 @@ const (
 	ConfigFileName = "settings.yaml"
 )
 
+// LLM provider constants
+const (
+	ProviderOllama    = "ollama"
+	ProviderAnthropic = "anthropic"
+)
+
 // Config holds all configuration for bsau
 type Config struct {
 	HomebrewPath string `mapstructure:"homebrew_path"`
@@ -20,24 +26,27 @@ type Config struct {
 	Features    FeaturesConfig    `mapstructure:"features"`
 	BlockPolicy BlockPolicyConfig `mapstructure:"block_policy"`
 
-	OllamaURL          string `mapstructure:"ollama_url"`
-	OllamaModel        string `mapstructure:"ollama_model"`
-	OllamaMaxFileBytes int    `mapstructure:"ollama_max_file_bytes"`
+	LLMURL          string `mapstructure:"llm_url"`
+	LLMModel        string `mapstructure:"llm_model"`
+	LLMMaxFileBytes int    `mapstructure:"llm_max_file_bytes"`
+
+	YaraRulesDir string `mapstructure:"yara_rules_dir"`
 
 	// Runtime overrides (set via CLI flags)
-	NoOllama  bool `mapstructure:"-"`
-	NoSemgrep bool `mapstructure:"-"`
-	DryRun    bool `mapstructure:"-"`
-	Verbose   bool `mapstructure:"-"`
+	NoLLM   bool `mapstructure:"-"`
+	NoYara  bool `mapstructure:"-"`
+	DryRun  bool `mapstructure:"-"`
+	Verbose bool `mapstructure:"-"`
 }
 
 type FeaturesConfig struct {
-	OllamaScan bool `mapstructure:"ollama_scan"`
+	LLMScan     bool   `mapstructure:"llm_scan"`
+	LLMProvider string `mapstructure:"llm_provider"`
 }
 
 type BlockPolicyConfig struct {
-	OllamaFormulaHold bool `mapstructure:"ollama_formula_hold"`
-	OllamaCodeHold    bool `mapstructure:"ollama_code_hold"`
+	LLMFormulaHold bool `mapstructure:"llm_formula_hold"`
+	LLMCodeHold    bool `mapstructure:"llm_code_hold"`
 }
 
 // GetBinaryDir returns the directory where the bsau binary is located
@@ -69,12 +78,14 @@ func Load() (*Config, error) {
 
 	// Set defaults
 	v.SetDefault("homebrew_path", "/opt/homebrew")
-	v.SetDefault("features.ollama_scan", false)
-	v.SetDefault("block_policy.ollama_formula_hold", true)
-	v.SetDefault("block_policy.ollama_code_hold", true)
-	v.SetDefault("ollama_url", "http://localhost:11434")
-	v.SetDefault("ollama_model", "") // Must be set in settings.yaml when ollama_scan is enabled
-	v.SetDefault("ollama_max_file_bytes", 12000)
+	v.SetDefault("features.llm_scan", false)
+	v.SetDefault("features.llm_provider", ProviderOllama)
+	v.SetDefault("block_policy.llm_formula_hold", true)
+	v.SetDefault("block_policy.llm_code_hold", true)
+	v.SetDefault("llm_url", "http://localhost:11434")
+	v.SetDefault("llm_model", "") // Must be set in settings.yaml when llm_scan is enabled
+	v.SetDefault("llm_max_file_bytes", 12000)
+	v.SetDefault("yara_rules_dir", "")
 
 	// Check for config override via env
 	configPath := os.Getenv("BSAU_CONFIG")
@@ -111,16 +122,28 @@ func Load() (*Config, error) {
 
 // Validate checks configuration validity
 func (c *Config) Validate() error {
-	// If Ollama is enabled, model must be set
-	if c.Features.OllamaScan && c.OllamaModel == "" {
-		return fmt.Errorf("ollama_model must be set in settings.yaml when features.ollama_scan is enabled")
+	// If LLM is enabled, validate provider-specific requirements
+	if c.Features.LLMScan {
+		switch c.Features.LLMProvider {
+		case ProviderOllama:
+			if c.LLMModel == "" {
+				return fmt.Errorf("llm_model must be set in settings.yaml when features.llm_scan is enabled with ollama provider")
+			}
+		case ProviderAnthropic:
+			if os.Getenv("ANTHROPIC_API_KEY") == "" {
+				return fmt.Errorf("ANTHROPIC_API_KEY environment variable must be set when using anthropic provider")
+			}
+			// Model is optional for Anthropic (has default)
+		default:
+			return fmt.Errorf("invalid llm_provider: %s (must be 'ollama' or 'anthropic')", c.Features.LLMProvider)
+		}
 	}
 	return nil
 }
 
-// IsOllamaEnabled returns true if Ollama scanning is enabled and not overridden
-func (c *Config) IsOllamaEnabled() bool {
-	return c.Features.OllamaScan && !c.NoOllama
+// IsLLMEnabled returns true if LLM scanning is enabled and not overridden
+func (c *Config) IsLLMEnabled() bool {
+	return c.Features.LLMScan && !c.NoLLM
 }
 
 // CellarPath returns the path to the Homebrew Cellar
@@ -138,29 +161,30 @@ homebrew_path: /opt/homebrew
 
 # Feature flags - enable optional scanning features
 features:
-  # Enable local LLM analysis (requires Ollama running locally)
-  # Install: brew install ollama && ollama pull <model>
-  # NOTE: If the Ollama server does not have adequate resources (CPU/GPU/RAM),
-  # scans will take significantly longer. Each file chunk can take 30-60+ seconds.
-  # For best performance, use a machine with a dedicated GPU or Apple Silicon.
-  ollama_scan: false
+  # Enable LLM-based code analysis
+  # Requires either Ollama running locally OR ANTHROPIC_API_KEY set
+  llm_scan: false
 
-# Ollama server URL (default: http://localhost:11434)
-ollama_url: http://localhost:11434
+  # LLM provider to use: "ollama" or "anthropic"
+  # - ollama: Local LLM via Ollama (free, requires ollama running)
+  # - anthropic: Claude API (requires ANTHROPIC_API_KEY env var)
+  llm_provider: ollama
 
-# LLM model to use for analysis (required when ollama_scan is enabled)
-# Examples: gemma4:e2b, llama3, mistral, etc.
-# Run 'ollama list' to see available models
-# Smaller models (e.g., gemma4:e2b) are faster but may be less accurate
-ollama_model: ""
+# LLM URL (only used for Ollama provider)
+llm_url: http://localhost:11434
+
+# LLM model to use for analysis
+# For Ollama: required (e.g., gemma3, llama3, mistral)
+# For Anthropic: optional (defaults to claude-sonnet-4-6)
+llm_model: ""
 
 # Maximum formula file size in bytes sent to LLM
-ollama_max_file_bytes: 12000
+llm_max_file_bytes: 12000
 
 # Blocking policy - which signals block an upgrade
 block_policy:
-  ollama_formula_hold: true   # Block if LLM formula analysis returns HOLD
-  ollama_code_hold: true      # Block if LLM code analysis returns HOLD
+  llm_formula_hold: true   # Block if LLM formula analysis returns HOLD
+  llm_code_hold: true      # Block if LLM code analysis returns HOLD
 `
 
 // GenerateConfigFile creates a default config file in the binary directory

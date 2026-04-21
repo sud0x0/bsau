@@ -1,26 +1,33 @@
-# bsau (brew-scan-and-update) configuration
+# bsau configuration file
+# Place this file in the same directory as the bsau binary
 
 # Path to Homebrew installation. Defaults to /opt/homebrew (Apple Silicon).
+# Override for Intel Macs: /usr/local
 homebrew_path: /opt/homebrew
 
-# Feature flags — opt-in to scans that require external dependencies.
-# OSV vulnerability scanning always runs without any key.
+# Feature flags - enable optional scanning features
 features:
-  ollama_scan: true      # Requires Ollama running locally (ollama serve)
+  # Enable LLM-based code analysis
+  # Requires either Ollama running locally OR ANTHROPIC_API_KEY set
+  llm_scan: false
 
-# Blocking policy.
-# Pre-install (Step 3): Ollama formula analysis.
-# Post-install (Step 6a): Semgrep + Ollama code scan.
-block_policy:
-  ollama_formula_hold: true   # Block if Ollama formula analysis returns HOLD (Step 3)
-  ollama_code_hold: true      # Block if Ollama code analysis returns HOLD (Step 6a)
+  # LLM provider to use: "ollama" or "anthropic"
+  # - ollama: Local LLM via Ollama (free, requires ollama running)
+  # - anthropic: Claude API (requires ANTHROPIC_API_KEY env var)
+  llm_provider: ollama
 
-# Ollama server URL (default: http://localhost:11434)
-ollama_url: http://10.211.55.41:11434
+# LLM URL (only used for Ollama provider)
+llm_url: http://localhost:11434
 
-# Ollama model to use for analysis (default: gemma3)
-# Requires: ollama pull gemma3
-ollama_model: gemma4:e2b
+# LLM model to use for analysis
+# For Ollama: required (e.g., gemma3, llama3, mistral)
+# For Anthropic: optional (defaults to claude-sonnet-4-6)
+llm_model: ""
 
-# Maximum file size in bytes sent to Ollama. Larger files are truncated.
-ollama_max_file_bytes: 12000
+# Maximum file size in bytes sent to LLM. Larger files are truncated.
+llm_max_file_bytes: 12000
+
+# Path to YARA rules directory for development override.
+# Leave empty to use the rules embedded in the binary.
+# Set to an absolute path to load .yar files from disk without rebuilding.
+yara_rules_dir: ""

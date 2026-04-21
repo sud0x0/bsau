@@ -94,8 +94,10 @@ type QueryStats struct {
 	PackagesSkipped  int
 	OSVQueries       int
 	NVDQueries       int
-	GitQueries       int // Deprecated, always 0
-	EcosystemQueries int // Deprecated, same as OSVQueries
+	NVDFailures      int      // Number of NVD queries that failed (timeout, etc.)
+	NVDFailedPkgs    []string // Names of packages with NVD query failures
+	GitQueries       int      // Deprecated, always 0
+	EcosystemQueries int      // Deprecated, same as OSVQueries
 }
 
 // OSV API types
@@ -376,6 +378,8 @@ func (s *Scanner) queryNVD(packages []PackageInfo, mappings map[string]*PackageM
 		vulns, err := s.queryNVDForPackage(pkg, mapping)
 		if err != nil {
 			fmt.Printf("[WARN] NVD query failed for %s: %v\n", pkg.Name, err)
+			stats.NVDFailures++
+			stats.NVDFailedPkgs = append(stats.NVDFailedPkgs, pkg.Name)
 			results[pkg.Name] = &VulnResult{
 				Package:     pkg.Name,
 				Version:     pkg.Version,

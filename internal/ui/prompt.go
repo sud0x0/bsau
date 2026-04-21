@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sud0x0/bsau/internal/ollama"
+	"github.com/sud0x0/bsau/internal/llm"
 	"golang.org/x/term"
 )
 
@@ -189,7 +189,7 @@ func (p *Prompter) excludePackages(packages []string) ([]string, error) {
 }
 
 // ConfirmPackageUpgrade asks for confirmation before upgrading a specific package
-func (p *Prompter) ConfirmPackageUpgrade(pkg string, verdict ollama.Verdict, reason string) (bool, error) {
+func (p *Prompter) ConfirmPackageUpgrade(pkg string, verdict llm.Verdict, reason string) (bool, error) {
 	fmt.Println()
 	fmt.Printf("Package: %s%s%s\n", ColorBold, pkg, ColorReset)
 	fmt.Printf("Verdict: %s\n", colorVerdict(verdict))
@@ -197,7 +197,7 @@ func (p *Prompter) ConfirmPackageUpgrade(pkg string, verdict ollama.Verdict, rea
 		fmt.Printf("Reason:  %s\n", reason)
 	}
 
-	return p.Confirm("Proceed with upgrade?", verdict == ollama.VerdictSafe)
+	return p.Confirm("Proceed with upgrade?", verdict == llm.VerdictSafe)
 }
 
 // WaitForEnter waits for the user to press Enter
@@ -255,10 +255,10 @@ func (p *Prompter) ReadInput(prompt string) (string, error) {
 
 // APIUsageInfo contains information about API usage for user confirmation
 type APIUsageInfo struct {
-	StepName       string   // Name of the step (e.g., "Pre-install Ollama scan")
-	OllamaPackages []string // Packages that will use Ollama
-	VTRequests     int      // Total VT API requests required
-	VTFiles        []string // Files that will be checked via VT
+	StepName    string   // Name of the step (e.g., "Pre-install LLM scan")
+	LLMPackages []string // Packages that will use LLM
+	VTRequests  int      // Total VT API requests required
+	VTFiles     []string // Files that will be checked via VT
 }
 
 // ConfirmAPIUsage asks the user to confirm API usage before proceeding
@@ -270,23 +270,23 @@ func (p *Prompter) ConfirmAPIUsage(info APIUsageInfo) (bool, error) {
 	fmt.Printf("%s└─────────────────────────────────────────────────────────────┘%s\n", ColorCyan, ColorReset)
 	fmt.Println()
 
-	hasOllamaUsage := len(info.OllamaPackages) > 0
+	hasLLMUsage := len(info.LLMPackages) > 0
 	hasVTUsage := info.VTRequests > 0
 
-	if !hasOllamaUsage && !hasVTUsage {
+	if !hasLLMUsage && !hasVTUsage {
 		fmt.Println("  No API calls required for this step.")
 		return true, nil
 	}
 
-	if hasOllamaUsage {
-		fmt.Printf("  %sOllama (local):%s\n", ColorBold, ColorReset)
-		fmt.Printf("    Packages (%d):   ", len(info.OllamaPackages))
-		if len(info.OllamaPackages) <= 5 {
-			fmt.Printf("%s\n", strings.Join(info.OllamaPackages, ", "))
+	if hasLLMUsage {
+		fmt.Printf("  %sLLM (local/API):%s\n", ColorBold, ColorReset)
+		fmt.Printf("    Packages (%d):   ", len(info.LLMPackages))
+		if len(info.LLMPackages) <= 5 {
+			fmt.Printf("%s\n", strings.Join(info.LLMPackages, ", "))
 		} else {
 			fmt.Printf("%s, ... (+%d more)\n",
-				strings.Join(info.OllamaPackages[:5], ", "),
-				len(info.OllamaPackages)-5)
+				strings.Join(info.LLMPackages[:5], ", "),
+				len(info.LLMPackages)-5)
 		}
 		fmt.Println()
 	}
@@ -323,9 +323,9 @@ func (p *Prompter) ConfirmAPIUsage(info APIUsageInfo) (bool, error) {
 
 // QuotaSufficiency represents whether there's enough API quota for an operation
 type QuotaSufficiency struct {
-	// Ollama (local - no quota limits, always available if running)
-	OllamaPackagesRequired int
-	OllamaAvailable        bool
+	// LLM (local - no quota limits if Ollama, API limits if Anthropic)
+	LLMPackagesRequired int
+	LLMAvailable        bool
 
 	// VirusTotal
 	VTRequestsRequired   int
@@ -340,21 +340,21 @@ type QuotaSufficiency struct {
 
 // CheckQuotaSufficiency compares required usage against available quota
 func CheckQuotaSufficiency(
-	ollamaPackagesRequired int, ollamaAvailable bool,
+	llmPackagesRequired int, llmAvailable bool,
 	vtRequestsRequired, vtRequestsAvailable int,
 ) *QuotaSufficiency {
 	s := &QuotaSufficiency{
-		OllamaPackagesRequired: ollamaPackagesRequired,
-		OllamaAvailable:        ollamaAvailable,
-		VTRequestsRequired:     vtRequestsRequired,
-		VTRequestsAvailable:    vtRequestsAvailable,
+		LLMPackagesRequired: llmPackagesRequired,
+		LLMAvailable:        llmAvailable,
+		VTRequestsRequired:  vtRequestsRequired,
+		VTRequestsAvailable: vtRequestsAvailable,
 	}
 
 	// Check VT requests
 	s.VTRequestsSufficient = vtRequestsRequired <= vtRequestsAvailable || vtRequestsRequired == 0
 
-	// Overall assessment - Ollama is local so always available if running
-	s.CanProceed = (ollamaPackagesRequired == 0 || ollamaAvailable) && s.VTRequestsSufficient
+	// Overall assessment - LLM is local (Ollama) or API (Anthropic)
+	s.CanProceed = (llmPackagesRequired == 0 || llmAvailable) && s.VTRequestsSufficient
 
 	// Check if partial work is possible
 	if !s.CanProceed {
@@ -370,10 +370,10 @@ func CheckQuotaSufficiency(
 func (s *QuotaSufficiency) buildWarning() {
 	var warnings []string
 
-	if s.OllamaPackagesRequired > 0 && !s.OllamaAvailable {
+	if s.LLMPackagesRequired > 0 && !s.LLMAvailable {
 		warnings = append(warnings, fmt.Sprintf(
-			"Ollama not available: %d packages require Ollama scan",
-			s.OllamaPackagesRequired))
+			"LLM not available: %d packages require LLM scan",
+			s.LLMPackagesRequired))
 	}
 
 	if !s.VTRequestsSufficient {
@@ -389,11 +389,11 @@ func (s *QuotaSufficiency) buildWarning() {
 
 // APIQuotaStatus contains quota information for all APIs
 type APIQuotaStatus struct {
-	// Ollama (local)
-	OllamaEnabled   bool
-	OllamaAvailable bool
-	OllamaModel     string
-	OllamaError     error
+	// LLM
+	LLMEnabled   bool
+	LLMAvailable bool
+	LLMModel     string
+	LLMError     error
 
 	// VirusTotal API
 	VTEnabled        bool
@@ -412,20 +412,20 @@ func DisplayAPIQuota(status APIQuotaStatus) {
 	fmt.Printf("%s└─────────────────────────────────────────────────────────────┘%s\n", ColorCyan, ColorReset)
 	fmt.Println()
 
-	// Ollama status
-	if status.OllamaEnabled {
-		fmt.Printf("  %sOllama (local):%s\n", ColorBold, ColorReset)
-		if status.OllamaError != nil {
-			fmt.Printf("    %sError: %s%s\n", ColorRed, status.OllamaError, ColorReset)
-		} else if status.OllamaAvailable {
+	// LLM status
+	if status.LLMEnabled {
+		fmt.Printf("  %sLLM:%s\n", ColorBold, ColorReset)
+		if status.LLMError != nil {
+			fmt.Printf("    %sError: %s%s\n", ColorRed, status.LLMError, ColorReset)
+		} else if status.LLMAvailable {
 			fmt.Printf("    Status:  %sAvailable%s\n", ColorGreen, ColorReset)
-			fmt.Printf("    Model:   %s\n", status.OllamaModel)
+			fmt.Printf("    Model:   %s\n", status.LLMModel)
 		} else {
-			fmt.Printf("    Status:  %sNot running%s (start with: ollama serve)\n", ColorRed, ColorReset)
+			fmt.Printf("    Status:  %sNot available%s\n", ColorRed, ColorReset)
 		}
 		fmt.Println()
 	} else {
-		fmt.Printf("  %sOllama:%s %sDisabled%s (set features.ollama_scan: true)\n",
+		fmt.Printf("  %sLLM:%s %sDisabled%s (set features.llm_scan: true)\n",
 			ColorBold, ColorReset, ColorYellow, ColorReset)
 		fmt.Println()
 	}
@@ -477,11 +477,10 @@ func (p *Prompter) ConfirmInsufficientQuota(sufficiency *QuotaSufficiency) (Insu
 	fmt.Println()
 
 	// Show what's unavailable
-	if sufficiency.OllamaPackagesRequired > 0 && !sufficiency.OllamaAvailable {
-		fmt.Printf("  %sOllama (local):%s\n", ColorBold, ColorReset)
-		fmt.Printf("    Status:    %sNot running%s\n", ColorRed, ColorReset)
-		fmt.Printf("    Required:  %s%d%s packages need scanning\n", ColorYellow, sufficiency.OllamaPackagesRequired, ColorReset)
-		fmt.Printf("    Start with: ollama serve\n")
+	if sufficiency.LLMPackagesRequired > 0 && !sufficiency.LLMAvailable {
+		fmt.Printf("  %sLLM:%s\n", ColorBold, ColorReset)
+		fmt.Printf("    Status:    %sNot available%s\n", ColorRed, ColorReset)
+		fmt.Printf("    Required:  %s%d%s packages need scanning\n", ColorYellow, sufficiency.LLMPackagesRequired, ColorReset)
 		fmt.Println()
 	}
 
@@ -541,24 +540,24 @@ func DisplayQuotaComparison(sufficiency *QuotaSufficiency, stepName string) {
 	fmt.Printf("%s└─────────────────────────────────────────────────────────────┘%s\n", ColorCyan, ColorReset)
 	fmt.Println()
 
-	// Ollama section
-	if sufficiency.OllamaPackagesRequired > 0 {
-		fmt.Printf("  %sOllama (local):%s\n", ColorBold, ColorReset)
-		ollamaColor := ColorGreen
-		ollamaIcon := "✓"
-		if !sufficiency.OllamaAvailable {
-			ollamaColor = ColorRed
-			ollamaIcon = "✗"
+	// LLM section
+	if sufficiency.LLMPackagesRequired > 0 {
+		fmt.Printf("  %sLLM:%s\n", ColorBold, ColorReset)
+		llmColor := ColorGreen
+		llmIcon := "✓"
+		if !sufficiency.LLMAvailable {
+			llmColor = ColorRed
+			llmIcon = "✗"
 		}
 		fmt.Printf("    %s%s%s Status:   %s\n",
-			ollamaColor, ollamaIcon, ColorReset,
+			llmColor, llmIcon, ColorReset,
 			func() string {
-				if sufficiency.OllamaAvailable {
+				if sufficiency.LLMAvailable {
 					return "Available"
 				}
-				return "Not running"
+				return "Not available"
 			}())
-		fmt.Printf("    Packages: %d to scan\n", sufficiency.OllamaPackagesRequired)
+		fmt.Printf("    Packages: %d to scan\n", sufficiency.LLMPackagesRequired)
 		fmt.Println()
 	}
 

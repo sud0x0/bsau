@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/sud0x0/bsau/internal/ollama"
+	"github.com/sud0x0/bsau/internal/llm"
 )
 
 func TestSeverity_Constants(t *testing.T) {
@@ -51,12 +51,12 @@ func TestColorSeverity(t *testing.T) {
 
 func TestColorVerdict(t *testing.T) {
 	tests := []struct {
-		verdict  ollama.Verdict
+		verdict  llm.Verdict
 		contains string
 	}{
-		{ollama.VerdictSafe, ColorGreen},
-		{ollama.VerdictReview, ColorYellow},
-		{ollama.VerdictHold, ColorRed},
+		{llm.VerdictSafe, ColorGreen},
+		{llm.VerdictReview, ColorYellow},
+		{llm.VerdictHold, ColorRed},
 	}
 
 	for _, tt := range tests {
@@ -168,31 +168,31 @@ func TestPreInstallRow_Structure(t *testing.T) {
 	row := PreInstallRow{
 		Package:        "openssl",
 		CVECount:       5,
-		OllamaVerdict:  ollama.VerdictReview,
+		LLMVerdict:     llm.VerdictReview,
 		Recommendation: "REVIEW",
 	}
 
 	if row.Package != "openssl" {
 		t.Errorf("expected Package openssl, got %s", row.Package)
 	}
-	if row.OllamaVerdict != ollama.VerdictReview {
-		t.Errorf("expected VerdictReview, got %v", row.OllamaVerdict)
+	if row.LLMVerdict != llm.VerdictReview {
+		t.Errorf("expected VerdictReview, got %v", row.LLMVerdict)
 	}
 }
 
 func TestPostInstallRow_Structure(t *testing.T) {
 	row := PostInstallRow{
-		Package:       "curl",
-		SemgrepCount:  0,
-		OllamaVerdict: ollama.VerdictSafe,
-		Overall:       "CLEAN",
+		Package:    "curl",
+		YaraCount:  0,
+		LLMVerdict: llm.VerdictSafe,
+		Overall:    "CLEAN",
 	}
 
 	if row.Package != "curl" {
 		t.Errorf("expected Package curl, got %s", row.Package)
 	}
-	if row.SemgrepCount != 0 {
-		t.Errorf("expected SemgrepCount 0, got %d", row.SemgrepCount)
+	if row.YaraCount != 0 {
+		t.Errorf("expected YaraCount 0, got %d", row.YaraCount)
 	}
 }
 
@@ -266,6 +266,34 @@ func TestProgress_Update(t *testing.T) {
 	}
 }
 
+func TestProgress_SetStatus(t *testing.T) {
+	p := NewProgress("Test", 3)
+
+	// Update increments counter
+	p.Update("item1")
+	if p.current != 1 {
+		t.Errorf("expected current 1 after Update, got %d", p.current)
+	}
+
+	// SetStatus does NOT increment counter
+	p.SetStatus("item1 (yara)")
+	if p.current != 1 {
+		t.Errorf("expected current still 1 after SetStatus, got %d", p.current)
+	}
+
+	// SetStatus again - still no increment
+	p.SetStatus("item1 (llm)")
+	if p.current != 1 {
+		t.Errorf("expected current still 1 after second SetStatus, got %d", p.current)
+	}
+
+	// Update increments again
+	p.Update("item2")
+	if p.current != 2 {
+		t.Errorf("expected current 2 after second Update, got %d", p.current)
+	}
+}
+
 func TestTruncate_EdgeCases(t *testing.T) {
 	// Test with exactly maxLen
 	result := truncate("hello", 5)
@@ -288,41 +316,41 @@ func TestTruncate_EdgeCases(t *testing.T) {
 
 func TestAPIUsageInfo_Structure(t *testing.T) {
 	info := APIUsageInfo{
-		StepName:       "Pre-install Ollama scan",
-		OllamaPackages: []string{"ripgrep", "curl", "wget"},
+		StepName:    "Pre-install LLM scan",
+		LLMPackages: []string{"ripgrep", "curl", "wget"},
 	}
 
-	if info.StepName != "Pre-install Ollama scan" {
-		t.Errorf("expected StepName 'Pre-install Ollama scan', got %s", info.StepName)
+	if info.StepName != "Pre-install LLM scan" {
+		t.Errorf("expected StepName 'Pre-install LLM scan', got %s", info.StepName)
 	}
-	if len(info.OllamaPackages) != 3 {
-		t.Errorf("expected 3 OllamaPackages, got %d", len(info.OllamaPackages))
+	if len(info.LLMPackages) != 3 {
+		t.Errorf("expected 3 LLMPackages, got %d", len(info.LLMPackages))
 	}
 }
 
 func TestAPIUsageInfo_EmptyUsage(t *testing.T) {
 	info := APIUsageInfo{
-		StepName:       "Test step",
-		OllamaPackages: nil,
+		StepName:    "Test step",
+		LLMPackages: nil,
 	}
 
-	hasOllamaUsage := len(info.OllamaPackages) > 0
+	hasLLMUsage := len(info.LLMPackages) > 0
 
-	if hasOllamaUsage {
-		t.Error("expected no Ollama usage when packages is empty")
+	if hasLLMUsage {
+		t.Error("expected no LLM usage when packages is empty")
 	}
 }
 
-func TestAPIUsageInfo_OnlyOllama(t *testing.T) {
+func TestAPIUsageInfo_OnlyLLM(t *testing.T) {
 	info := APIUsageInfo{
-		StepName:       "Ollama-only step",
-		OllamaPackages: []string{"pkg1"},
+		StepName:    "LLM-only step",
+		LLMPackages: []string{"pkg1"},
 	}
 
-	hasOllamaUsage := len(info.OllamaPackages) > 0
+	hasLLMUsage := len(info.LLMPackages) > 0
 
-	if !hasOllamaUsage {
-		t.Error("expected Ollama usage when packages > 0")
+	if !hasLLMUsage {
+		t.Error("expected LLM usage when packages > 0")
 	}
 }
 
@@ -333,18 +361,18 @@ func TestAPIUsageInfo_ManyPackages(t *testing.T) {
 	}
 
 	info := APIUsageInfo{
-		StepName:       "Many packages",
-		OllamaPackages: packages,
+		StepName:    "Many packages",
+		LLMPackages: packages,
 	}
 
 	// Verify the package list is stored correctly
-	if len(info.OllamaPackages) != 10 {
-		t.Errorf("expected 10 packages, got %d", len(info.OllamaPackages))
+	if len(info.LLMPackages) != 10 {
+		t.Errorf("expected 10 packages, got %d", len(info.LLMPackages))
 	}
 	// When displayed, only first 5 should show with "+X more"
 	displayCount := 5
-	if len(info.OllamaPackages) > displayCount {
-		remaining := len(info.OllamaPackages) - displayCount
+	if len(info.LLMPackages) > displayCount {
+		remaining := len(info.LLMPackages) - displayCount
 		if remaining != 5 {
 			t.Errorf("expected 5 remaining packages, got %d", remaining)
 		}
@@ -443,77 +471,77 @@ func TestInteractiveSelector_PinnedNotLocked(t *testing.T) {
 
 func TestAPIQuotaStatus_Structure(t *testing.T) {
 	status := APIQuotaStatus{
-		OllamaEnabled:   true,
-		OllamaAvailable: true,
-		OllamaModel:     "gemma3",
-		OllamaError:     nil,
+		LLMEnabled:   true,
+		LLMAvailable: true,
+		LLMModel:     "gemma3",
+		LLMError:     nil,
 	}
 
-	if !status.OllamaEnabled {
-		t.Error("expected OllamaEnabled to be true")
+	if !status.LLMEnabled {
+		t.Error("expected LLMEnabled to be true")
 	}
-	if !status.OllamaAvailable {
-		t.Error("expected OllamaAvailable to be true")
+	if !status.LLMAvailable {
+		t.Error("expected LLMAvailable to be true")
 	}
-	if status.OllamaModel != "gemma3" {
-		t.Errorf("expected OllamaModel gemma3, got %s", status.OllamaModel)
+	if status.LLMModel != "gemma3" {
+		t.Errorf("expected LLMModel gemma3, got %s", status.LLMModel)
 	}
 }
 
-func TestAPIQuotaStatus_OllamaUnavailable(t *testing.T) {
+func TestAPIQuotaStatus_LLMUnavailable(t *testing.T) {
 	status := APIQuotaStatus{
-		OllamaEnabled:   true,
-		OllamaAvailable: false, // Ollama not running
-		OllamaModel:     "gemma3",
+		LLMEnabled:   true,
+		LLMAvailable: false, // LLM not running
+		LLMModel:     "gemma3",
 	}
 
-	if !status.OllamaEnabled {
-		t.Error("expected OllamaEnabled to be true")
+	if !status.LLMEnabled {
+		t.Error("expected LLMEnabled to be true")
 	}
-	if status.OllamaAvailable {
-		t.Error("expected OllamaAvailable to be false when not running")
+	if status.LLMAvailable {
+		t.Error("expected LLMAvailable to be false when not running")
 	}
 }
 
 func TestAPIQuotaStatus_WithError(t *testing.T) {
 	status := APIQuotaStatus{
-		OllamaEnabled: true,
-		OllamaError:   fmt.Errorf("connection refused"),
+		LLMEnabled: true,
+		LLMError:   fmt.Errorf("connection refused"),
 	}
 
-	if status.OllamaError == nil {
-		t.Error("expected OllamaError to be set")
+	if status.LLMError == nil {
+		t.Error("expected LLMError to be set")
 	}
 }
 
 func TestCheckQuotaSufficiency_AllSufficient(t *testing.T) {
 	s := CheckQuotaSufficiency(
-		5, true, // Ollama: 5 packages required, available
+		5, true, // LLM: 5 packages required, available
 		0, 0, // No VT
 	)
 
 	if !s.CanProceed {
 		t.Error("expected CanProceed to be true when all sufficient")
 	}
-	if !s.OllamaAvailable {
-		t.Error("expected OllamaAvailable to be true")
+	if !s.LLMAvailable {
+		t.Error("expected LLMAvailable to be true")
 	}
 	if s.Warning != "" {
 		t.Errorf("expected no warning, got %s", s.Warning)
 	}
 }
 
-func TestCheckQuotaSufficiency_OllamaUnavailable(t *testing.T) {
+func TestCheckQuotaSufficiency_LLMUnavailable(t *testing.T) {
 	s := CheckQuotaSufficiency(
-		5, false, // Ollama: 5 packages required, NOT available
+		5, false, // LLM: 5 packages required, NOT available
 		0, 0, // No VT
 	)
 
 	if s.CanProceed {
-		t.Error("expected CanProceed to be false when Ollama unavailable")
+		t.Error("expected CanProceed to be false when LLM unavailable")
 	}
-	if s.OllamaAvailable {
-		t.Error("expected OllamaAvailable to be false")
+	if s.LLMAvailable {
+		t.Error("expected LLMAvailable to be false")
 	}
 	if s.Warning == "" {
 		t.Error("expected warning message")
@@ -522,7 +550,7 @@ func TestCheckQuotaSufficiency_OllamaUnavailable(t *testing.T) {
 
 func TestCheckQuotaSufficiency_ZeroRequired(t *testing.T) {
 	s := CheckQuotaSufficiency(
-		0, true, // Ollama: none required
+		0, true, // LLM: none required
 		0, 0, // No VT
 	)
 
@@ -533,18 +561,18 @@ func TestCheckQuotaSufficiency_ZeroRequired(t *testing.T) {
 
 func TestQuotaSufficiency_Structure(t *testing.T) {
 	s := QuotaSufficiency{
-		OllamaPackagesRequired: 5,
-		OllamaAvailable:        false,
-		CanProceed:             false,
-		PartialPossible:        false,
-		Warning:                "Ollama not available: 5 packages require Ollama scan",
+		LLMPackagesRequired: 5,
+		LLMAvailable:        false,
+		CanProceed:          false,
+		PartialPossible:     false,
+		Warning:             "LLM not available: 5 packages require LLM scan",
 	}
 
-	if s.OllamaPackagesRequired != 5 {
-		t.Errorf("expected OllamaPackagesRequired 5, got %d", s.OllamaPackagesRequired)
+	if s.LLMPackagesRequired != 5 {
+		t.Errorf("expected LLMPackagesRequired 5, got %d", s.LLMPackagesRequired)
 	}
-	if s.OllamaAvailable {
-		t.Error("expected OllamaAvailable to be false")
+	if s.LLMAvailable {
+		t.Error("expected LLMAvailable to be false")
 	}
 	if s.CanProceed {
 		t.Error("expected CanProceed to be false")

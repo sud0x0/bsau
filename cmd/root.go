@@ -27,7 +27,7 @@ var rootCmd = &cobra.Command{
 
 It scans, audits, and safely updates Homebrew packages on macOS by combining:
   - Vulnerability lookup via OSV.dev and NIST NVD
-  - Static analysis via Semgrep
+  - Static analysis via YARA-X
   - LLM-based code analysis via Ollama (local)
 
 All scanning is read-only. No packages are modified without explicit user approval.
@@ -104,6 +104,9 @@ func init() {
 	// Global flags
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is ./settings.yaml)")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "enable verbose output")
+
+	// Disable the default 'help' subcommand (use --help flag instead)
+	rootCmd.SetHelpCommand(&cobra.Command{Hidden: true})
 
 	// Add subcommands
 	rootCmd.AddCommand(runCmd)

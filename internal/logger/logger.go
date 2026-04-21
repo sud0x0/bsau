@@ -49,17 +49,20 @@ func Init(binaryDir string, verbose bool) error {
 
 // writeHeader writes initial log header
 func (l *Logger) writeHeader() {
-	l.write("=== bsau session started ===")
-	l.write("Time: %s", time.Now().Format("2006-01-02 15:04:05"))
-	l.write("Verbose: %v", l.verbose)
-	l.write("Log file: %s", l.file.Name())
-	l.write("")
+	l.writeRaw("")
+	l.writeRaw("════════════════════════════════════════")
+	l.writeRaw("SESSION START: %s", time.Now().Format("2006-01-02 15:04:05"))
+	l.writeRaw("════════════════════════════════════════")
+	l.writeRaw("")
 }
 
 // Close closes the log file
 func Close() {
 	if instance != nil && instance.file != nil {
-		Info("=== Session ended ===")
+		instance.writeRaw("")
+		instance.writeRaw("════════════════════════════════════════")
+		instance.writeRaw("SESSION END: %s", time.Now().Format("2006-01-02 15:04:05"))
+		instance.writeRaw("════════════════════════════════════════")
 		_ = instance.file.Close()
 	}
 }
@@ -81,6 +84,20 @@ func GetLogPath() string {
 	return ""
 }
 
+// writeRaw writes to log file without timestamp prefix
+func (l *Logger) writeRaw(format string, args ...interface{}) {
+	if l.file == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	msg := fmt.Sprintf(format, args...)
+	_, _ = fmt.Fprintln(l.file, msg)
+	_ = l.file.Sync()
+}
+
+// write writes to log file with timestamp
 func (l *Logger) write(format string, args ...interface{}) {
 	if l.file == nil {
 		return
@@ -92,6 +109,28 @@ func (l *Logger) write(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	_, _ = fmt.Fprintf(l.file, "[%s] %s\n", timestamp, msg)
 	_ = l.file.Sync()
+}
+
+// printVerbose prints to terminal only when verbose mode is active
+// Does NOT write to log file
+func (l *Logger) printVerbose(format string, args ...interface{}) {
+	if !l.verbose {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fmt.Printf(format, args...)
+}
+
+// StepHeader writes a formatted step header to the log file
+func StepHeader(step int, total int, title string) {
+	if instance == nil {
+		return
+	}
+	instance.writeRaw("")
+	instance.writeRaw("════════════════════════════════════════")
+	instance.writeRaw("STEP %d/%d: %s", step, total, title)
+	instance.writeRaw("════════════════════════════════════════")
 }
 
 // Info logs basic information (always logged)
@@ -136,86 +175,144 @@ func Error(format string, args ...interface{}) {
 	}
 }
 
-// Debug logs detailed information (only when verbose)
+// Debug logs detailed information (only when verbose, to log file)
 func Debug(format string, args ...interface{}) {
 	if instance != nil && instance.verbose {
 		instance.write("[DEBUG] "+format, args...)
 	}
 }
 
+// Verbose prints to terminal only when -v is active
+// Does NOT write to log file - use for terminal-only verbose output
+func Verbose(format string, args ...interface{}) {
+	if instance != nil {
+		instance.printVerbose(format, args...)
+	}
+}
+
 // Section starts a new section in the log (always logged)
 func Section(name string) {
 	if instance != nil {
-		instance.write("")
-		instance.write("=== %s ===", name)
+		instance.writeRaw("")
+		instance.write("── %s ──", name)
 	}
 }
 
-// --- Ollama-specific logging ---
+// --- LLM-specific logging (provider-agnostic) ---
 
-// OllamaRequest logs an Ollama API request
-func OllamaRequest(model, systemPrompt, userPrompt string) {
+// LLMRequest logs an LLM API request (basic info to log file, full content to terminal in verbose)
+func LLMRequest(provider, model, systemPrompt, userPrompt string) {
 	if instance == nil {
 		return
 	}
-	instance.write("[OLLAMA] Request to model: %s", model)
-	if instance.verbose {
-		// In verbose mode, log full content (sanitize newlines for readability)
-		instance.write("[OLLAMA] System prompt (%d chars):", len(systemPrompt))
-		instance.write("%s", sanitize(systemPrompt))
-		instance.write("[OLLAMA] User prompt (%d chars):", len(userPrompt))
-		instance.write("%s", sanitize(userPrompt))
-	}
+	tag := strings.ToUpper(provider)
+	// Basic info always goes to log file
+	instance.write("[%s] Request to model: %s (%d chars)", tag, model, len(userPrompt))
 }
 
-// OllamaResponse logs an Ollama API response
-func OllamaResponse(elapsed time.Duration, content string) {
+// LLMResponse logs an LLM API response (basic info to log file, full content to terminal in verbose)
+func LLMResponse(provider string, elapsed time.Duration, content string) {
 	if instance == nil {
 		return
 	}
-	instance.write("[OLLAMA] Response in %v (%d chars)", elapsed, len(content))
+	tag := strings.ToUpper(provider)
+	// Basic info always goes to log file
+	instance.write("[%s] Response in %v (%d chars)", tag, elapsed, len(content))
+}
+
+// VerboseLLMRequest logs LLM request info and optionally prints to terminal in verbose mode
+// Always writes compact summary to log file, full content to terminal only in verbose mode
+func VerboseLLMRequest(pkg string, chunkNum, totalChunks int, systemPrompt, userPrompt string) {
+	if instance == nil {
+		return
+	}
+	// Always write compact summary to log file
+	instance.write("[LLM] REQUEST pkg=%s chunk=%d/%d prompt_chars=%d", pkg, chunkNum, totalChunks, len(userPrompt))
+
+	// Verbose terminal output only
 	if instance.verbose {
-		// In verbose mode, log full response
-		instance.write("[OLLAMA] Content:")
-		instance.write("%s", sanitize(content))
+		instance.printVerbose("\n── LLM REQUEST ─────────────────────────\n")
+		instance.printVerbose("Package:  %s\n", pkg)
+		if totalChunks > 1 {
+			instance.printVerbose("Chunk:    %d of %d\n", chunkNum, totalChunks)
+		}
+		instance.printVerbose("System:   %s\n", truncateForDisplay(systemPrompt, 200))
+		instance.printVerbose("User:     %s\n", truncateForDisplay(userPrompt, 500))
+		instance.printVerbose("────────────────────────────────────────\n")
 	}
 }
 
-// OllamaError logs an Ollama error
-func OllamaError(err error) {
+// VerboseLLMResponse logs LLM response info and optionally prints to terminal in verbose mode
+// Always writes compact summary to log file, full content to terminal only in verbose mode
+func VerboseLLMResponse(pkg string, chunkNum, totalChunks int, elapsed time.Duration, verdict, content string) {
+	if instance == nil {
+		return
+	}
+	// Always write compact summary to log file
+	instance.write("[LLM] RESPONSE pkg=%s chunk=%d/%d elapsed=%.1fs verdict=%s chars=%d",
+		pkg, chunkNum, totalChunks, elapsed.Seconds(), verdict, len(content))
+
+	// Verbose terminal output only
+	if instance.verbose {
+		instance.printVerbose("\n── LLM RESPONSE ────────────────────────\n")
+		instance.printVerbose("%s\n", content)
+		instance.printVerbose("────────────────────────────────────────\n")
+	}
+}
+
+// LLMError logs an LLM error
+func LLMError(provider string, err error) {
 	if instance != nil {
-		instance.write("[OLLAMA] ERROR: %v", err)
+		tag := strings.ToUpper(provider)
+		instance.write("[%s] ERROR: %v", tag, err)
 	}
 }
 
-// OllamaChunk logs chunk processing
-func OllamaChunk(file string, chunkNum, totalChunks int) {
+// LLMChunk logs chunk processing
+func LLMChunk(provider, file string, chunkNum, totalChunks int) {
 	if instance != nil && instance.verbose {
-		instance.write("[OLLAMA] Processing chunk %d/%d of %s", chunkNum, totalChunks, filepath.Base(file))
+		tag := strings.ToUpper(provider)
+		instance.write("[%s] Processing chunk %d/%d of %s", tag, chunkNum, totalChunks, filepath.Base(file))
 	}
 }
 
-// --- Semgrep-specific logging ---
+// --- YARA-specific logging ---
 
-// SemgrepScan logs a Semgrep scan
-func SemgrepScan(pkg, path string) {
+// YaraScan logs a YARA scan
+func YaraScan(pkg, path string) {
 	if instance != nil {
-		instance.write("[SEMGREP] Scanning %s: %s", pkg, path)
+		instance.write("[YARA] Scanning %s: %s", pkg, path)
 	}
 }
 
-// SemgrepResult logs Semgrep results
-func SemgrepResult(pkg string, findingCount int) {
+// YaraResult logs YARA results
+func YaraResult(pkg string, findingCount int) {
 	if instance != nil {
-		instance.write("[SEMGREP] %s: %d findings", pkg, findingCount)
+		instance.write("[YARA] %s: %d findings", pkg, findingCount)
 	}
 }
 
-// SemgrepFinding logs individual findings (verbose only)
-func SemgrepFinding(file string, line int, ruleID, severity string) {
-	if instance != nil && instance.verbose {
-		instance.write("[SEMGREP] Finding: %s:%d [%s] %s", filepath.Base(file), line, severity, ruleID)
+// YaraFinding logs individual findings (to log file)
+func YaraFinding(file string, ruleID, severity string) {
+	if instance != nil {
+		instance.write("[YARA] Finding: %s [%s] %s", filepath.Base(file), severity, ruleID)
 	}
+}
+
+// VerboseYaraFinding prints formatted YARA finding to terminal only (verbose mode)
+func VerboseYaraFinding(ruleID, severity, filePath string, lineNum int, message string) {
+	if instance == nil || !instance.verbose {
+		return
+	}
+	instance.printVerbose("\n── YARA FINDING ────────────────────────\n")
+	instance.printVerbose("Rule:     %s\n", ruleID)
+	instance.printVerbose("Severity: %s\n", severity)
+	instance.printVerbose("File:     %s\n", filePath)
+	if lineNum > 0 {
+		instance.printVerbose("Line:     %d\n", lineNum)
+	}
+	instance.printVerbose("Message:  %s\n", message)
+	instance.printVerbose("────────────────────────────────────────\n")
 }
 
 // --- Vulnerability-specific logging ---
@@ -238,8 +335,19 @@ func VulnResult(pkg string, cveCount int, maxSeverity string) {
 	}
 }
 
-// sanitize cleans content for logging while preserving full text
-func sanitize(s string) string {
-	// Replace tabs with spaces, keep newlines for readability
-	return strings.ReplaceAll(s, "\t", "  ")
+// truncateForDisplay truncates a string for display, adding ellipsis if truncated
+func truncateForDisplay(s string, maxLen int) string {
+	// Replace newlines with spaces for single-line display
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\t", " ")
+	// Collapse multiple spaces
+	for strings.Contains(s, "  ") {
+		s = strings.ReplaceAll(s, "  ", " ")
+	}
+	s = strings.TrimSpace(s)
+
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }

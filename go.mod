@@ -3,9 +3,9 @@ module github.com/sud0x0/bsau
 go 1.25.0
 
 require (
-	github.com/DCSO/bloom v0.2.4
 	github.com/goark/go-cvss v1.6.7
 	github.com/google/uuid v1.6.0
+	github.com/hillu/go-yara/v4 v4.3.4
 	github.com/olekukonko/tablewriter v0.0.5
 	github.com/spf13/cobra v1.8.0
 	github.com/spf13/viper v1.18.2

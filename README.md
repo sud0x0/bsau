@@ -41,7 +41,7 @@ bsau performs multiple layers of security analysis before and after every upgrad
 ## Key Features
 
 1. **Vulnerability Scanning** - Uses OSV.dev and NIST NVD for comprehensive CVE detection
-2. **Static Analysis** - Semgrep scans with supply-chain, secrets, and malicious-code rule sets
+2. **YARA Scanning** - Full YARA 4.x malware pattern matching via libyara detects reverse shells, credential theft, obfuscation, persistence mechanisms, and C2 patterns. Requires `brew install yara`.
 3. **Local LLM Analysis** - Analyzes formula files and code diffs for suspicious patterns
 4. **Detailed Reports** - Generates timestamped report files with vulnerability details and per-package scan results
 
@@ -52,15 +52,15 @@ bsau performs multiple layers of security analysis before and after every upgrad
 3. **Pre-install scan** - Local LLM analyzes formula history (current + 2 prior versions)
 4. **Approval gate** - User approves/blocks packages based on scan results
 5. **Upgrade** - Snapshot text files, run brew upgrade with stdio passthrough
-6. **Post-install verification** - Semgrep + local LLM on diffs
+6. **Post-install verification** - YARA scan (real libyara, full rule support) + local LLM on diffs
 7. **Cleanup** - Remove temp files, run brew cleanup
 
 ## Limitations
 
-1. **No static binary scanning**: bsau does not perform static analysis or hash verification on compiled binaries. Semgrep and local LLM analyse source/script files only. Compiled executables, libraries, and object files are not scanned for malware signatures or suspicious patterns.
+1. **No static binary scanning**: bsau does not perform static analysis or hash verification on compiled binaries. The YARA scanner and local LLM analyse source/script files only. Compiled executables, libraries, and object files are not scanned for malware signatures or suspicious patterns.
 2. **Binary-only casks**: Closed-source GUI applications have no formula source to analyze. Local LLM analysis is not meaningful for these.
 3. **Vulnerability database coverage**: bsau only queries OSV.dev and NIST NVD for vulnerabilities. Additional vulnerabilities may exist in other databases (e.g., GitHub Security Advisories, vendor-specific advisories, or security mailing lists) that are not checked. CVE counts shown may be incomplete or inaccurate. `N/A` means no mapping exists for that package.
-4. **Semgrep pattern matching**: Semgrep uses custom `bsau-malware.yaml` rules to detect malicious patterns (C2 IPs, reverse shells, credential harvesting, persistence mechanisms, etc.). Falls back to `p/supply-chain` and `p/secrets` if custom rules aren't available. Novel or heavily obfuscated attacks may evade signature-based detection.
+4. **YARA pattern matching**: bsau uses libyara 4.x (installed via `brew install yara`) with custom `.yar` rules to detect malicious patterns (C2 IPs, reverse shells, credential harvesting, persistence mechanisms, etc.). Novel or heavily obfuscated attacks may evade signature-based detection.
 5. **LLM context window**: Large formula files are truncated at `ollama_max_file_bytes` (default 12KB). Truncation is noted in findings but malicious code beyond the limit won't be analyzed.
 6. **Snapshot disk usage**: Pre-upgrade snapshots of text files may consume significant `/tmp` space for large packages. bsau warns when space is low and skips snapshots if critically low.
 7. **No transitive dependency scanning**: Only Homebrew-level packages are scanned, not runtime dependencies (e.g., Python packages inside a formula's venv).
@@ -74,13 +74,16 @@ bsau performs multiple layers of security analysis before and after every upgrad
 **Required:**
 - macOS (Apple Silicon or Intel)
 - [Homebrew](https://brew.sh/) installed
-- [Semgrep](https://semgrep.dev/docs/getting-started/quickstart) - for static analysis scans
+- [YARA](https://virustotal.github.io/yara/) — malware pattern matching engine
+
+```bash
+  brew install yara
+```
 
 **Optional (for full functionality):**
+- [Ollama](https://ollama.ai/) — for local LLM formula/code analysis (no API key needed)
 
-- [Ollama](https://ollama.ai/) - for local LLM formula/code analysis (no API key needed)
-
-> **Note:** OSV/NIST NVD vulnerability scanning and Semgrep require no API keys and are always active. Ollama is optional and runs locally - just install and run `ollama serve`.
+> **Note:** OSV/NIST NVD vulnerability scanning requires no API keys and is always active. YARA malware scanning requires `brew install yara`. Ollama is optional and runs locally.
 
 ## Option 1: Download from Releases
 
@@ -101,6 +104,8 @@ bsau version
 ```
 
 ## Option 2: Build from Source
+
+**Prerequisites:** Go 1.25+, and YARA (`brew install yara` — required for CGO build)
 
 ```bash
 # Clone the repository
@@ -138,13 +143,13 @@ bsau run --dry-run
 |---------|-------------|
 | `bsau run` | Full scan and update workflow |
 | `bsau run --dry-run` | Run scans, show results, skip upgrades |
-| `bsau run --no-semgrep` | Skip Semgrep scan for this run |
+| `bsau run --no-yara` | Skip YARA scan for this run |
 | `bsau run --no-ollama` | Skip local LLM analysis for this run |
 | `bsau inspect` | Show inspect help menu |
 | `bsau inspect <package>` | Scan a specific package |
 | `bsau inspect --all` | Scan all installed packages |
 | `bsau inspect ... --no-vuln` | Skip vulnerability scan |
-| `bsau inspect ... --no-semgrep` | Skip Semgrep scan |
+| `bsau inspect ... --no-yara` | Skip YARA scan |
 | `bsau inspect ... --no-ollama` | Skip local LLM analysis |
 | `bsau init` | Generate default config file in binary directory |
 | `bsau version` | Show version info |
@@ -247,17 +252,17 @@ curl http://10.211.55.41:11434/api/chat -d '{
 
 ## Step 6: Post-install Verification
 
-**6a. Semgrep Scan**
-- Runs with custom `rules/bsau-malware.yaml` rules designed for malware detection
+**6a. YARA Scan**
+- Runs with embedded `.yar` rules designed for malware detection
 - Detects: hardcoded IPs, reverse shells, credential harvesting, base64 decode + exec, persistence mechanisms, security bypasses
-- Parses JSON output for flagged files and line numbers
+- Pure Go implementation — no external binary required
 
 **6b. Diff Generation**
 - Generates unified diff between pre-upgrade snapshot and new install
 - Only text-readable files are diffed; binaries noted as changed
 
 **6c. Local LLM Code Analysis** *(if enabled)*
-- Sends the diff + Semgrep findings to local LLM
+- Sends the diff + YARA findings to local LLM
 - Analyzes for malicious patterns introduced in the new version
 - Returns verdict: `SAFE`, `REVIEW`, or `HOLD`
 - `HOLD` -> warns user, suggests `brew uninstall`
@@ -285,10 +290,10 @@ curl http://10.211.55.41:11434/api/chat -d '{
 
 - Go 1.21+
 - Homebrew (macOS)
+- [YARA](https://virustotal.github.io/yara/) (`brew install yara`) — required for CGO build of the scanning engine
 - [pre-commit](https://pre-commit.com/)
 - [golangci-lint](https://golangci-lint.run/)
 - [govulncheck](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck)
-- [Semgrep](https://semgrep.dev/) (for security scans)
 
 ## Setup Steps
 
@@ -313,9 +318,6 @@ curl http://10.211.55.41:11434/api/chat -d '{
 
    # Install pre-commit
    brew install pre-commit
-
-   # Install semgrep
-   brew install semgrep
    ```
 
 4. **Install pre-commit hooks**

@@ -2,22 +2,24 @@ package cmd
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/sud0x0/bsau/internal/brew"
+	"github.com/sud0x0/bsau/internal/config"
+	"github.com/sud0x0/bsau/internal/llm"
 	"github.com/sud0x0/bsau/internal/logger"
-	"github.com/sud0x0/bsau/internal/ollama"
-	"github.com/sud0x0/bsau/internal/semgrep"
 	"github.com/sud0x0/bsau/internal/snapshot"
 	"github.com/sud0x0/bsau/internal/ui"
 	"github.com/sud0x0/bsau/internal/vuln"
+	"github.com/sud0x0/bsau/internal/yara"
 )
 
 var (
-	inspectNoVuln    bool
-	inspectNoSemgrep bool
-	inspectNoOllama  bool
-	inspectAll       bool
+	inspectNoVuln bool
+	inspectNoYara bool
+	inspectNoLLM  bool
+	inspectAll    bool
 )
 
 var inspectCmd = &cobra.Command{
@@ -26,24 +28,24 @@ var inspectCmd = &cobra.Command{
 	Long: `Inspect runs security checks against the current installed state
 of your Homebrew packages without any upgrade.
 
-By default, runs all checks: Vulnerability scan + Semgrep + OLLAMA LLM (if enabled).
-Use --no-vuln, --no-semgrep, or --no-ollama to skip specific checks.
+By default, runs all checks: Vulnerability scan + YARA + LLM (if enabled).
+Use --no-vuln, --no-yara, or --no-llm to skip specific checks.
 
-Note: Both Semgrep and OLLAMA LLM can miss sophisticated attacks - using both provides defense in depth.
+Note: Both YARA and LLM can miss sophisticated attacks - using both provides defense in depth.
 
 Examples:
   bsau inspect                       # Show this help menu
   bsau inspect <package>             # Scan specific package (all checks)
   bsau inspect --all                 # Scan all installed packages
-  bsau inspect <package> --no-ollama # Skip OLLAMA LLM analysis
-  bsau inspect <package> --no-ollama --no-semgrep  # Vulnerability scan only`,
+  bsau inspect <package> --no-llm    # Skip LLM analysis
+  bsau inspect <package> --no-llm --no-yara  # Vulnerability scan only`,
 	RunE: runInspect,
 }
 
 func init() {
 	inspectCmd.Flags().BoolVar(&inspectNoVuln, "no-vuln", false, "skip vulnerability scan")
-	inspectCmd.Flags().BoolVar(&inspectNoSemgrep, "no-semgrep", false, "skip Semgrep scan")
-	inspectCmd.Flags().BoolVar(&inspectNoOllama, "no-ollama", false, "skip OLLAMA LLM analysis")
+	inspectCmd.Flags().BoolVar(&inspectNoYara, "no-yara", false, "skip YARA scan")
+	inspectCmd.Flags().BoolVar(&inspectNoLLM, "no-llm", false, "skip LLM analysis")
 	inspectCmd.Flags().BoolVar(&inspectAll, "all", false, "scan all installed packages")
 }
 
@@ -57,15 +59,15 @@ func runInspect(cmd *cobra.Command, args []string) error {
 	}
 
 	// Determine which checks to run based on config and flags
-	// By default, run all checks (vuln, Semgrep, Ollama if enabled)
+	// By default, run all checks (vuln, YARA, LLM if enabled)
 	runVulnCheck := !inspectNoVuln
-	runSemgrepCheck := !inspectNoSemgrep
-	runOllamaCheck := !inspectNoOllama && cfg.IsOllamaEnabled()
+	runYaraCheck := !inspectNoYara
+	runLLMCheck := !inspectNoLLM && cfg.IsLLMEnabled()
 
 	// If all scans are disabled, show error
-	if !runVulnCheck && !runSemgrepCheck && !runOllamaCheck {
+	if !runVulnCheck && !runYaraCheck && !runLLMCheck {
 		ui.PrintError("No scans enabled. At least one scan type must be enabled.")
-		ui.PrintInfo("Remove one of: --no-vuln, --no-semgrep, --no-ollama")
+		ui.PrintInfo("Remove one of: --no-vuln, --no-yara, --no-llm")
 		return nil
 	}
 
@@ -74,10 +76,10 @@ func runInspect(cmd *cobra.Command, args []string) error {
 	sigHandler.Start()
 	defer sigHandler.Stop()
 
-	// Warn if OLLAMA LLM is requested but not available
-	if !inspectNoOllama && !cfg.IsOllamaEnabled() {
-		ui.PrintWarning("OLLAMA LLM is not enabled in config.")
-		ui.PrintInfo("To enable OLLAMA LLM, set features.ollama_scan: true in settings.yaml")
+	// Warn if LLM is requested but not available
+	if !inspectNoLLM && !cfg.IsLLMEnabled() {
+		ui.PrintWarning("LLM is not enabled in config.")
+		ui.PrintInfo("To enable LLM, set features.llm_scan: true in settings.yaml")
 	}
 
 	// Initialize clients
@@ -126,7 +128,8 @@ func runInspect(cmd *cobra.Command, args []string) error {
 			}
 		}
 		var err error
-		vulnResults, _, err = vulnScanner.QueryPackages(packageInfos)
+		var vulnStats *vuln.QueryStats
+		vulnResults, vulnStats, err = vulnScanner.QueryPackages(packageInfos)
 		if err != nil {
 			ui.PrintWarning(fmt.Sprintf("Vulnerability scan failed: %v", err))
 			logger.Error("Vulnerability scan failed: %v", err)
@@ -136,35 +139,85 @@ func runInspect(cmd *cobra.Command, args []string) error {
 				logger.VulnResult(name, vr.CVECount, string(vr.MaxSeverity))
 			}
 		}
+
+		// If NVD queries failed, ask user whether to proceed
+		if vulnStats != nil && vulnStats.NVDFailures > 0 {
+			fmt.Println()
+			ui.PrintWarning(fmt.Sprintf("NVD queries failed for %d package(s): %v",
+				vulnStats.NVDFailures, vulnStats.NVDFailedPkgs))
+			ui.PrintWarning("CVE data from NVD may be incomplete for these packages.")
+			prompter := ui.NewPrompter()
+			proceed, promptErr := prompter.Confirm("Continue with potentially incomplete vulnerability data?", true)
+			if promptErr != nil {
+				return fmt.Errorf("reading user input: %w", promptErr)
+			}
+			if !proceed {
+				ui.PrintInfo("Aborting. Try again later when NVD API is available.")
+				return fmt.Errorf("user cancelled due to NVD query failures")
+			}
+		}
 	}
 
 	// Mark as in-progress so CTRL+C prompts before exiting
 	sigHandler.SetInProgress(true)
 	defer sigHandler.SetInProgress(false)
 
-	var semgrepRunner *semgrep.Runner
-	if runSemgrepCheck {
+	var yaraEngine *yara.Engine
+	if runYaraCheck {
 		var err error
-		semgrepRunner, err = semgrep.NewRunner()
+		yaraEngine, err = yara.New(cfg.YaraRulesDir, 30*time.Second)
 		if err != nil {
-			ui.PrintWarning(fmt.Sprintf("Semgrep not available: %v", err))
+			ui.PrintWarning(fmt.Sprintf("YARA not available: %v", err))
+		} else {
+			defer func() { _ = yaraEngine.Close() }()
 		}
 	}
 
-	var ollamaClient *ollama.Client
-	if runOllamaCheck {
-		ollamaClient = ollama.NewClient(cfg.OllamaURL, cfg.OllamaModel, cfg.OllamaMaxFileBytes)
-		// Check if Ollama is actually running
-		if err := ollamaClient.CheckAvailability(); err != nil {
-			ui.PrintWarning(fmt.Sprintf("OLLAMA LLM not available: %v", err))
-			ui.PrintWarning("Make sure OLLAMA is running with: ollama serve")
-			logger.Warn("OLLAMA LLM not available: %v", err)
-			runOllamaCheck = false
+	var llmProvider llm.Provider
+	if runLLMCheck {
+		var err error
+		llmProvider, err = llm.New(cfg.Features.LLMProvider, cfg.LLMModel, cfg.LLMURL, cfg.LLMMaxFileBytes)
+		if err != nil {
+			ui.PrintWarning(fmt.Sprintf("LLM not available: %v", err))
+			logger.Warn("LLM not available: %v", err)
+			runLLMCheck = false
+		} else {
+			// Check if LLM is actually available
+			if err := llmProvider.CheckAvailability(); err != nil {
+				ui.PrintWarning(fmt.Sprintf("LLM not available: %v", err))
+				if cfg.Features.LLMProvider == config.ProviderOllama {
+					ui.PrintWarning("Make sure Ollama is running with: ollama serve")
+				}
+				logger.Warn("LLM not available: %v", err)
+				runLLMCheck = false
+			}
 		}
+	}
+
+	// If LLM was requested but is not available, ask user whether to proceed
+	if cfg.IsLLMEnabled() && !inspectNoLLM && !runLLMCheck {
+		fmt.Println()
+		prompter := ui.NewPrompter()
+		proceed, err := prompter.Confirm("LLM analysis is unavailable. Continue without LLM code scan?", false)
+		if err != nil {
+			return fmt.Errorf("reading user input: %w", err)
+		}
+		if !proceed {
+			ui.PrintInfo("Aborting. Please fix LLM configuration and try again.")
+			return fmt.Errorf("user cancelled due to unavailable LLM")
+		}
+		ui.PrintInfo("Proceeding without LLM analysis...")
+		fmt.Println()
 	}
 
 	// Run inspections
 	results := make([]ui.PostInstallRow, 0, len(packages))
+	type yaraFindingsWithPath struct {
+		Findings []yara.Finding
+		BasePath string
+	}
+	yaraFindingsForDisplay := make(map[string]yaraFindingsWithPath) // For displaying after table
+	llmFindingsForDisplay := make(map[string][]llm.Finding)         // For displaying LLM findings after table
 
 	for _, pkg := range packages {
 		row := ui.PostInstallRow{
@@ -184,52 +237,60 @@ func runInspect(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// Semgrep scan
-		var semgrepFindings string
-		if semgrepRunner != nil {
-			logger.SemgrepScan(pkg.Name, brewClient.PackagePath(pkg.Name, pkg.Version))
-			semgrepResult, err := semgrepRunner.ScanPackage(
-				brewClient.CellarPath(),
-				pkg.Name,
-				pkg.Version,
-			)
+		// YARA scan
+		var yaraFindings string
+		if yaraEngine != nil {
+			pkgPath := brewClient.PackagePath(pkg.Name, pkg.Version)
+			logger.YaraScan(pkg.Name, pkgPath)
+			yaraResult, err := yaraEngine.ScanDir(pkgPath)
 			if err != nil {
-				ui.PrintWarning(fmt.Sprintf("Semgrep failed for %s: %v", pkg.Name, err))
-				logger.Error("Semgrep failed for %s: %v", pkg.Name, err)
+				ui.PrintWarning(fmt.Sprintf("YARA scan failed for %s: %v", pkg.Name, err))
+				logger.Error("YARA scan failed for %s: %v", pkg.Name, err)
 			} else {
-				row.SemgrepCount = semgrepResult.FindingCount
-				logger.SemgrepResult(pkg.Name, semgrepResult.FindingCount)
-				if semgrepResult.HasFindings && row.Overall == "OK" {
+				row.YaraCount = yaraResult.FindingCount
+				logger.YaraResult(pkg.Name, yaraResult.FindingCount)
+				if yaraResult.HasFindings && row.Overall == "OK" {
 					row.Overall = "REVIEW"
 				}
-				semgrepFindings = semgrep.FormatFindings(semgrepResult.Findings)
+				yaraFindings = yara.FormatFindings(yaraResult.Findings)
+				// Store findings for display after table
+				if yaraResult.HasFindings {
+					yaraFindingsForDisplay[pkg.Name] = yaraFindingsWithPath{
+						Findings: yaraResult.Findings,
+						BasePath: pkgPath,
+					}
+				}
 				// Log individual findings in verbose mode
-				for _, f := range semgrepResult.Findings {
-					logger.SemgrepFinding(f.Path, f.Start.Line, f.CheckID, f.Extra.Severity)
+				for _, f := range yaraResult.Findings {
+					logger.YaraFinding(f.Path, f.RuleID, f.Severity)
 				}
 			}
 		}
 
-		// Ollama analysis of ALL text files in the package
-		if ollamaClient != nil {
+		// LLM analysis of ALL text files in the package
+		if llmProvider != nil {
 			pkgPath := brewClient.PackagePath(pkg.Name, pkg.Version)
-			files, err := snapshot.CollectTextFiles(pkgPath, cfg.OllamaMaxFileBytes)
+			files, err := snapshot.CollectTextFiles(pkgPath, cfg.LLMMaxFileBytes)
 			if err != nil {
 				ui.PrintWarning(fmt.Sprintf("Failed to collect files for %s: %v", pkg.Name, err))
 				logger.Error("Failed to collect files for %s: %v", pkg.Name, err)
 			} else if len(files) > 0 {
 				ui.PrintInfo(fmt.Sprintf("Analyzing %d text files for %s...", len(files), pkg.Name))
-				logger.Info("OLLAMA LLM analyzing %d files for %s", len(files), pkg.Name)
-				codeResult, err := ollamaClient.AnalyzeFiles(pkg.Name, files, semgrepFindings)
+				logger.Info("LLM analyzing %d files for %s", len(files), pkg.Name)
+				codeResult, err := llmProvider.AnalyzeFiles(pkg.Name, files, yaraFindings)
 				if err != nil {
-					ui.PrintWarning(fmt.Sprintf("OLLAMA LLM analysis failed for %s: %v", pkg.Name, err))
-					logger.Error("OLLAMA LLM analysis failed for %s: %v", pkg.Name, err)
+					ui.PrintWarning(fmt.Sprintf("LLM analysis failed for %s: %v", pkg.Name, err))
+					logger.Error("LLM analysis failed for %s: %v", pkg.Name, err)
 				} else {
-					row.OllamaVerdict = codeResult.Verdict
-					logger.Result("OLLAMA LLM", pkg.Name, string(codeResult.Verdict))
-					if codeResult.Verdict == ollama.VerdictHold {
+					row.LLMVerdict = codeResult.Verdict
+					logger.Result("LLM", pkg.Name, string(codeResult.Verdict))
+					// Store findings for display after table
+					if len(codeResult.Findings) > 0 {
+						llmFindingsForDisplay[pkg.Name] = codeResult.Findings
+					}
+					if codeResult.Verdict == llm.VerdictHold {
 						row.Overall = "HOLD"
-					} else if codeResult.Verdict == ollama.VerdictReview && row.Overall != "MALICIOUS" {
+					} else if codeResult.Verdict == llm.VerdictReview && row.Overall != "MALICIOUS" {
 						row.Overall = "REVIEW"
 					}
 				}
@@ -242,10 +303,40 @@ func runInspect(cmd *cobra.Command, args []string) error {
 	// Display results
 	fmt.Println()
 	ui.RenderInspectTable(results, ui.InspectTableOptions{
-		ShowVuln:    runVulnCheck,
-		ShowSemgrep: runSemgrepCheck,
-		ShowOllama:  runOllamaCheck,
+		ShowVuln: runVulnCheck,
+		ShowYara: runYaraCheck,
+		ShowLLM:  runLLMCheck,
 	})
+
+	// Display YARA findings details if any packages need review
+	if len(yaraFindingsForDisplay) > 0 {
+		fmt.Println()
+		ui.PrintWarning("YARA findings requiring review:")
+		for pkgName, data := range yaraFindingsForDisplay {
+			fmt.Printf("\n  %s:\n", pkgName)
+			fmt.Print(yara.FormatFindingsRelative(data.Findings, data.BasePath))
+		}
+		fmt.Println()
+	}
+
+	// Display LLM findings details if any packages need review
+	if len(llmFindingsForDisplay) > 0 {
+		fmt.Println()
+		ui.PrintWarning("LLM code analysis findings requiring review:")
+		for pkgName, findings := range llmFindingsForDisplay {
+			fmt.Printf("\n  %s (%d findings):\n", pkgName, len(findings))
+			for _, f := range findings {
+				if f.LineNumber > 0 {
+					fmt.Printf("    - %s:%d: %s\n", f.File, f.LineNumber, f.Description)
+				} else if f.File != "" {
+					fmt.Printf("    - %s: %s\n", f.File, f.Description)
+				} else {
+					fmt.Printf("    - %s\n", f.Description)
+				}
+			}
+		}
+		fmt.Println()
+	}
 
 	// Display vulnerability details if any found
 	if runVulnCheck && len(vulnResults) > 0 {

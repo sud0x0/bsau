@@ -2,24 +2,25 @@ package cmd
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/sud0x0/bsau/internal/brew"
 	"github.com/sud0x0/bsau/internal/config"
+	"github.com/sud0x0/bsau/internal/llm"
 	"github.com/sud0x0/bsau/internal/logger"
-	"github.com/sud0x0/bsau/internal/ollama"
 	"github.com/sud0x0/bsau/internal/report"
-	"github.com/sud0x0/bsau/internal/semgrep"
 	"github.com/sud0x0/bsau/internal/snapshot"
 	"github.com/sud0x0/bsau/internal/state"
 	"github.com/sud0x0/bsau/internal/ui"
 	"github.com/sud0x0/bsau/internal/vuln"
+	"github.com/sud0x0/bsau/internal/yara"
 )
 
 var (
-	noOllama  bool
-	noSemgrep bool
-	dryRun    bool
+	noLLM  bool
+	noYara bool
+	dryRun bool
 )
 
 var runCmd = &cobra.Command{
@@ -29,17 +30,17 @@ var runCmd = &cobra.Command{
 
 1. Identify and audit current state (packages, CVEs)
 2. Identify what needs to be updated
-3. Pre-install security scan (local LLM formula analysis)
+3. Pre-install security scan (LLM formula analysis)
 4. Per-package approval gate
 5. Upgrade approved packages (with pre-upgrade snapshot)
-6. Post-install verification (Semgrep, local LLM code analysis)
+6. Post-install verification (YARA, LLM code analysis)
 7. Cleanup`,
 	RunE: runWorkflow,
 }
 
 func init() {
-	runCmd.Flags().BoolVar(&noOllama, "no-ollama", false, "skip local LLM analysis for this run")
-	runCmd.Flags().BoolVar(&noSemgrep, "no-semgrep", false, "skip Semgrep scan for this run")
+	runCmd.Flags().BoolVar(&noLLM, "no-llm", false, "skip LLM analysis for this run")
+	runCmd.Flags().BoolVar(&noYara, "no-yara", false, "skip YARA scan for this run")
 	runCmd.Flags().BoolVar(&dryRun, "dry-run", false, "run scans but do not upgrade")
 }
 
@@ -59,21 +60,23 @@ type Workflow struct {
 	runMgr         *state.RunManager
 	snapshotMgr    *snapshot.Manager
 	sigHandler     *ui.SignalHandler
-	ollamaClient   *ollama.Client
-	semgrepRunner  *semgrep.Runner
+	llmProvider    llm.Provider
+	yaraEngine     *yara.Engine
 	scanReport     *report.Report
 	failures       []ui.ScanFailure
 	outdated       []brew.OutdatedPackage
 	vulnResults    map[string]*vuln.VulnResult
-	formulaResults map[string]*ollama.FormulaAnalysisResult
-	semgrepStatus  string
-	ollamaStatus   string
+	formulaResults map[string]*llm.FormulaAnalysisResult
+	yaraStatus     string
+	llmStatus      string
+	llmError       string // Stores LLM error message from Step 3 for display in Step 6
 }
 
 // stepAudit executes Step 1: get outdated packages, query OSV/NVD, save pre-update vulns
 func (w *Workflow) stepAudit() error {
 	ui.PrintStep(1, 7, "Identify and Audit Current State",
 		"Scanning Homebrew packages, checking for outdated versions, and querying OSV/NIST NVD for vulnerabilities.")
+	logger.StepHeader(1, 7, "Identify and Audit Current State")
 
 	outdated, err := w.brewClient.GetOutdated()
 	if err != nil {
@@ -127,6 +130,22 @@ func (w *Workflow) stepAudit() error {
 			vulnStats.OSVQueries, vulnStats.NVDQueries, vulnStats.PackagesSkipped))
 	}
 
+	// If NVD queries failed, ask user whether to proceed
+	if vulnStats != nil && vulnStats.NVDFailures > 0 {
+		fmt.Println()
+		ui.PrintWarning(fmt.Sprintf("NVD queries failed for %d package(s): %v",
+			vulnStats.NVDFailures, vulnStats.NVDFailedPkgs))
+		ui.PrintWarning("CVE data from NVD may be incomplete for these packages.")
+		proceed, err := w.prompter.Confirm("Continue with potentially incomplete vulnerability data?", true)
+		if err != nil {
+			return fmt.Errorf("reading user input: %w", err)
+		}
+		if !proceed {
+			ui.PrintInfo("Aborting. Try again later when NVD API is available.")
+			return fmt.Errorf("user cancelled due to NVD query failures")
+		}
+	}
+
 	// Save pre-update vulnerability results to run-scoped state
 	preUpdateVulns := make(map[string]interface{})
 	for name, result := range w.vulnResults {
@@ -149,6 +168,7 @@ func (w *Workflow) stepAudit() error {
 func (w *Workflow) stepSelectPackages(pinnedSet map[string]bool) ([]string, error) {
 	ui.PrintStep(2, 7, "Identify What Needs to Be Updated",
 		"Displaying outdated packages with vulnerability info. Select which packages to update.")
+	logger.StepHeader(2, 7, "Identify What Needs to Be Updated")
 
 	// Create report file in binary directory
 	binDir, err := config.GetBinaryDir()
@@ -242,6 +262,28 @@ func (w *Workflow) stepSelectPackages(pinnedSet map[string]bool) ([]string, erro
 	fmt.Println()
 	ui.RenderPackageTable(rows)
 
+	// Display CVE details if any packages have vulnerabilities
+	hasVulns := false
+	for _, vr := range w.vulnResults {
+		if vr.CVECount > 0 {
+			hasVulns = true
+			break
+		}
+	}
+	if hasVulns {
+		fmt.Println()
+		ui.PrintWarning("CVE details:")
+		for name, vr := range w.vulnResults {
+			if vr.CVECount > 0 {
+				fmt.Printf("\n  %s (%d CVEs):\n", name, vr.CVECount)
+				for _, v := range vr.Vulns {
+					fmt.Printf("    - %s [%s]\n", v.ID, v.Severity)
+				}
+			}
+		}
+		fmt.Println()
+	}
+
 	// Warn about pinned packages with CVEs
 	for _, pkg := range w.outdated {
 		isPinned := pkg.Pinned || pinnedSet[pkg.Name]
@@ -271,17 +313,18 @@ func (w *Workflow) stepSelectPackages(pinnedSet map[string]bool) ([]string, erro
 	return selectedPkgs, nil
 }
 
-// stepPreInstallScan executes Step 3: Ollama formula analysis
+// stepPreInstallScan executes Step 3: LLM formula analysis
 func (w *Workflow) stepPreInstallScan(selectedPkgs []string) error {
 	ui.PrintStep(3, 7, "Pre-install Security Scan",
-		"Analyzing formula files with OLLAMA LLM to detect malicious patterns before upgrade.")
+		"Analyzing formula files with LLM to detect malicious patterns before upgrade.")
+	logger.StepHeader(3, 7, "Pre-install Security Scan")
 
-	w.formulaResults = make(map[string]*ollama.FormulaAnalysisResult)
+	w.formulaResults = make(map[string]*llm.FormulaAnalysisResult)
 
 	// Show scan status
 	fmt.Println("Scan status:")
-	if !w.cfg.IsOllamaEnabled() {
-		ui.PrintSkipped("OLLAMA LLM formula analysis: disabled (enable with 'ollama_scan: true' in settings.yaml)")
+	if !w.cfg.IsLLMEnabled() {
+		ui.PrintSkipped("LLM formula analysis: disabled (enable with 'llm_scan: true' in settings.yaml)")
 		// Mark all selected packages as skipped for formula analysis
 		for _, pkgName := range selectedPkgs {
 			if w.scanReport != nil {
@@ -292,50 +335,98 @@ func (w *Workflow) stepPreInstallScan(selectedPkgs []string) error {
 		return nil
 	}
 
-	ui.PrintInfo("OLLAMA LLM formula analysis: enabled")
+	ui.PrintInfo("LLM formula analysis: enabled")
 	fmt.Println()
-	w.ollamaClient = ollama.NewClient(w.cfg.OllamaURL, w.cfg.OllamaModel, w.cfg.OllamaMaxFileBytes)
-	// Check if Ollama is actually running
-	if err := w.ollamaClient.CheckAvailability(); err != nil {
-		ui.PrintWarning(fmt.Sprintf("OLLAMA LLM not available: %v", err))
-		ui.PrintWarning("Make sure OLLAMA is running with: ollama serve")
-		w.ollamaClient = nil
+
+	// Create LLM provider based on config
+	var err error
+	w.llmProvider, err = llm.New(w.cfg.Features.LLMProvider, w.cfg.LLMModel, w.cfg.LLMURL, w.cfg.LLMMaxFileBytes)
+	if err != nil {
+		w.llmError = err.Error()
+		ui.PrintWarning(fmt.Sprintf("LLM not available: %v", err))
+		w.llmProvider = nil
 	}
 
-	if w.ollamaClient != nil {
-		ollamaProgress := ui.NewProgress("Analyzing formulas", len(selectedPkgs))
+	// Check if LLM is actually available
+	if w.llmProvider != nil {
+		if err := w.llmProvider.CheckAvailability(); err != nil {
+			w.llmError = err.Error()
+			ui.PrintWarning(fmt.Sprintf("LLM not available: %v", err))
+			if w.cfg.Features.LLMProvider == config.ProviderOllama {
+				ui.PrintWarning("Make sure Ollama is running with: ollama serve")
+			}
+			w.llmProvider = nil
+		}
+	}
+
+	// If LLM is not available, ask user whether to proceed
+	if w.llmProvider == nil {
+		fmt.Println()
+		proceed, err := w.prompter.Confirm("LLM analysis is unavailable. Continue without formula security scan?", false)
+		if err != nil {
+			return fmt.Errorf("reading user input: %w", err)
+		}
+		if !proceed {
+			ui.PrintInfo("Aborting. Please fix LLM configuration and try again.")
+			return fmt.Errorf("user cancelled due to unavailable LLM")
+		}
+		ui.PrintInfo("Proceeding without LLM formula analysis...")
+		fmt.Println()
+		// Mark all selected packages as skipped for formula analysis
 		for _, pkgName := range selectedPkgs {
-			ollamaProgress.Update(pkgName)
+			if w.scanReport != nil {
+				w.scanReport.SetFormulaAnalysis(pkgName, "skipped")
+			}
+		}
+		return nil
+	}
+
+	if w.llmProvider != nil {
+		llmProgress := ui.NewProgress("Analyzing formulas", len(selectedPkgs))
+		for _, pkgName := range selectedPkgs {
+			llmProgress.Update(pkgName)
 			versions, err := w.brewClient.GetFormulaVersions(pkgName)
 			if err != nil {
-				ollamaProgress.Clear()
+				llmProgress.Clear()
 				ui.PrintWarning(fmt.Sprintf("Failed to get formula for %s: %v", pkgName, err))
-				ollamaProgress.Skip()
+				llmProgress.Skip()
 				if w.scanReport != nil {
 					w.scanReport.SetFormulaAnalysis(pkgName, "failed")
 				}
 				continue
 			}
 
-			result, err := w.ollamaClient.AnalyzeFormula(pkgName, versions)
+			result, err := w.llmProvider.AnalyzeFormula(pkgName, versions)
 			if err != nil {
-				ollamaProgress.Clear()
-				ui.PrintWarning(fmt.Sprintf("OLLAMA LLM analysis failed for %s: %v", pkgName, err))
-				result = &ollama.FormulaAnalysisResult{
+				llmProgress.Clear()
+				ui.PrintWarning(fmt.Sprintf("LLM analysis failed for %s: %v", pkgName, err))
+				result = &llm.FormulaAnalysisResult{
 					Package: pkgName,
-					Verdict: ollama.VerdictReview,
+					Verdict: llm.VerdictReview,
 				}
 				if w.scanReport != nil {
 					w.scanReport.SetFormulaAnalysis(pkgName, "failed")
 				}
 			} else if w.scanReport != nil {
 				w.scanReport.SetFormulaAnalysis(pkgName, string(result.Verdict))
+				// Add detailed findings to report
+				if len(result.Findings) > 0 {
+					reportFindings := make([]report.LLMFinding, len(result.Findings))
+					for i, f := range result.Findings {
+						reportFindings[i] = report.LLMFinding{
+							File:        f.File,
+							LineNumber:  f.LineNumber,
+							Description: f.Description,
+						}
+					}
+					w.scanReport.AddFormulaFindings(pkgName, reportFindings)
+				}
 			}
 			w.formulaResults[pkgName] = result
 		}
-		ollamaProgress.Done()
+		llmProgress.Done()
 	} else {
-		// Ollama not available, mark all as skipped
+		// LLM not available, mark all as skipped
 		for _, pkgName := range selectedPkgs {
 			if w.scanReport != nil {
 				w.scanReport.SetFormulaAnalysis(pkgName, "skipped")
@@ -343,7 +434,7 @@ func (w *Workflow) stepPreInstallScan(selectedPkgs []string) error {
 		}
 	}
 
-	// Save Ollama formula analysis results to run-scoped state
+	// Save LLM formula analysis results to run-scoped state
 	scanResults := make(map[string]interface{})
 	for name, result := range w.formulaResults {
 		scanResults[name] = map[string]interface{}{
@@ -364,6 +455,7 @@ func (w *Workflow) stepPreInstallScan(selectedPkgs []string) error {
 func (w *Workflow) stepApproval(selectedPkgs []string) ([]string, error) {
 	ui.PrintStep(4, 7, "Per-Package Approval Gate",
 		"Review scan results and approve packages for upgrade. Blocked packages require manual review.")
+	logger.StepHeader(4, 7, "Per-Package Approval Gate")
 
 	preInstallRows := make([]ui.PreInstallRow, 0, len(selectedPkgs))
 	approvedPkgs := make([]string, 0)
@@ -373,18 +465,18 @@ func (w *Workflow) stepApproval(selectedPkgs []string) ([]string, error) {
 		fr := w.formulaResults[pkgName]
 
 		recommendation := "PROCEED"
-		var verdict ollama.Verdict
+		var verdict llm.Verdict
 
 		if fr != nil {
 			verdict = fr.Verdict
 			switch verdict {
-			case ollama.VerdictHold:
-				if w.cfg.BlockPolicy.OllamaFormulaHold {
+			case llm.VerdictHold:
+				if w.cfg.BlockPolicy.LLMFormulaHold {
 					recommendation = "BLOCK"
 				} else {
 					recommendation = "REVIEW"
 				}
-			case ollama.VerdictReview:
+			case llm.VerdictReview:
 				recommendation = "REVIEW"
 			}
 		}
@@ -392,18 +484,18 @@ func (w *Workflow) stepApproval(selectedPkgs []string) ([]string, error) {
 		preInstallRows = append(preInstallRows, ui.PreInstallRow{
 			Package:        pkgName,
 			CVECount:       vr.CVECount,
-			OllamaVerdict:  verdict,
+			LLMVerdict:     verdict,
 			Recommendation: recommendation,
 		})
 	}
 
 	fmt.Println()
-	ui.RenderPreInstallTable(preInstallRows, w.cfg.IsOllamaEnabled())
+	ui.RenderPreInstallTable(preInstallRows, w.cfg.IsLLMEnabled())
 
 	// Process approvals
 	for _, row := range preInstallRows {
 		if row.Recommendation == "BLOCK" {
-			ui.PrintWarning(fmt.Sprintf("Package %s blocked: OLLAMA LLM returned HOLD verdict", row.Package))
+			ui.PrintWarning(fmt.Sprintf("Package %s blocked: LLM returned HOLD verdict", row.Package))
 			// Show findings if available
 			if fr := w.formulaResults[row.Package]; fr != nil && len(fr.Findings) > 0 {
 				for _, f := range fr.Findings {
@@ -425,7 +517,7 @@ func (w *Workflow) stepApproval(selectedPkgs []string) ([]string, error) {
 					reason += f.Description
 				}
 			}
-			approved, err := w.prompter.ConfirmPackageUpgrade(row.Package, row.OllamaVerdict, reason)
+			approved, err := w.prompter.ConfirmPackageUpgrade(row.Package, row.LLMVerdict, reason)
 			if err != nil {
 				return nil, fmt.Errorf("confirming upgrade: %w", err)
 			}
@@ -444,6 +536,7 @@ func (w *Workflow) stepApproval(selectedPkgs []string) ([]string, error) {
 func (w *Workflow) stepUpgrade(approvedPkgs []string) ([]upgradedPkg, int, error) {
 	ui.PrintStep(5, 7, "Upgrade Packages",
 		"Creating pre-upgrade snapshots and running brew upgrade for each approved package.")
+	logger.StepHeader(5, 7, "Upgrade Packages")
 	ui.PrintRunDir(w.runMgr.RunDir())
 	ui.PrintInfo(fmt.Sprintf("Upgrading %d package(s)...", len(approvedPkgs)))
 
@@ -529,48 +622,59 @@ func (w *Workflow) stepUpgrade(approvedPkgs []string) ([]upgradedPkg, int, error
 	return upgraded, failed, nil
 }
 
-// stepVerify executes Step 6: semgrep + ollama post-install verification
+// stepVerify executes Step 6: yara + llm post-install verification
 func (w *Workflow) stepVerify(upgraded []upgradedPkg) ([]ui.PostInstallRow, error) {
 	ui.PrintStep(6, 7, "Post-Install Verification",
-		"Verifying upgraded packages with Semgrep and OLLAMA LLM code analysis.\n  Note: Both tools can miss sophisticated attacks - using both provides defense in depth.")
+		"Verifying upgraded packages with YARA and LLM code analysis.\n  Note: Both tools can miss sophisticated attacks - using both provides defense in depth.")
+	logger.StepHeader(6, 7, "Post-Install Verification")
 
 	// Show scan status
 	fmt.Println("Scan status:")
 
-	// Initialize Semgrep
-	if w.cfg.NoSemgrep {
-		ui.PrintSkipped("Semgrep scan: skipped (--no-semgrep)")
-		w.semgrepStatus = "skipped (--no-semgrep)"
+	// Initialize YARA
+	if w.cfg.NoYara {
+		ui.PrintSkipped("YARA scan: skipped (--no-yara)")
+		w.yaraStatus = "skipped (--no-yara)"
 	} else {
 		var err error
-		w.semgrepRunner, err = semgrep.NewRunner()
+		w.yaraEngine, err = yara.New(w.cfg.YaraRulesDir, 30*time.Second)
 		if err != nil {
-			ui.PrintSkipped(fmt.Sprintf("Semgrep scan: not available (%v)", err))
-			w.semgrepStatus = fmt.Sprintf("not run (not available: %v)", err)
+			ui.PrintSkipped(fmt.Sprintf("YARA scan: not available (%v)", err))
+			w.yaraStatus = fmt.Sprintf("not run (not available: %v)", err)
 		} else {
-			ui.PrintInfo("Semgrep scan: enabled")
-			w.semgrepStatus = "completed"
+			defer func() { _ = w.yaraEngine.Close() }()
+			ui.PrintInfo("YARA scan: enabled")
+			w.yaraStatus = "completed"
 		}
 	}
 
-	// OLLAMA LLM code analysis status
-	if w.cfg.IsOllamaEnabled() && w.ollamaClient != nil {
-		ui.PrintInfo("OLLAMA LLM code analysis: enabled")
-		w.ollamaStatus = "completed"
-	} else if w.cfg.NoOllama {
-		ui.PrintSkipped("OLLAMA LLM code analysis: skipped (--no-ollama)")
-		w.ollamaStatus = "skipped (--no-ollama)"
-	} else if !w.cfg.Features.OllamaScan {
-		ui.PrintSkipped("OLLAMA LLM code analysis: disabled in config")
-		w.ollamaStatus = "disabled in config"
+	// LLM code analysis status
+	if w.cfg.IsLLMEnabled() && w.llmProvider != nil {
+		ui.PrintInfo("LLM code analysis: enabled")
+		w.llmStatus = "completed"
+	} else if w.cfg.NoLLM {
+		ui.PrintSkipped("LLM code analysis: skipped (--no-llm)")
+		w.llmStatus = "skipped (--no-llm)"
+	} else if !w.cfg.Features.LLMScan {
+		ui.PrintSkipped("LLM code analysis: disabled in config")
+		w.llmStatus = "disabled in config"
+	} else if w.llmError != "" {
+		ui.PrintWarning(fmt.Sprintf("LLM not available: %s", w.llmError))
+		w.llmStatus = fmt.Sprintf("not run (%s)", w.llmError)
 	} else {
-		ui.PrintSkipped("OLLAMA LLM code analysis: not available (OLLAMA not running)")
-		w.ollamaStatus = "not run (OLLAMA not running)"
+		ui.PrintSkipped("LLM code analysis: not available (LLM provider not running)")
+		w.llmStatus = "not run (LLM provider not running)"
 	}
 	fmt.Println()
 
 	postInstallRows := make([]ui.PostInstallRow, 0, len(upgraded))
-	semgrepResultsMap := make(map[string]interface{})
+	yaraResultsMap := make(map[string]interface{})
+	type yaraFindingsWithPath struct {
+		Findings []yara.Finding
+		BasePath string
+	}
+	yaraFindingsForDisplay := make(map[string]yaraFindingsWithPath) // For displaying after table
+	llmFindingsForDisplay := make(map[string][]llm.Finding)         // For displaying LLM findings after table
 
 	verifyProgress := ui.NewProgress("Verifying packages", len(upgraded))
 	for _, pkg := range upgraded {
@@ -580,97 +684,193 @@ func (w *Workflow) stepVerify(upgraded []upgradedPkg) ([]ui.PostInstallRow, erro
 			Overall: "OK",
 		}
 
-		// Track semgrep result for reuse in Ollama analysis
-		var lastSemgrepResult *semgrep.PackageScanResult
+		// Track YARA result for reuse in LLM analysis
+		var lastYaraResult *yara.DirScanResult
 
-		// Semgrep scan
-		verifyProgress.Update(fmt.Sprintf("%s (semgrep)", pkg.Name))
-		if w.semgrepRunner != nil {
-			semgrepResult, err := w.semgrepRunner.ScanPackage(
-				w.brewClient.CellarPath(),
-				pkg.Name,
-				pkg.NewVersion,
-			)
+		// Get paths for this package
+		snapshotPath := w.runMgr.PackageSnapshotDir(pkg.Name, pkg.OldVersion)
+		newPath := w.brewClient.PackagePath(pkg.Name, pkg.NewVersion)
+
+		// Generate diff FIRST (before YARA) so we can scope YARA to changed files
+		var diff string
+		if w.snapshotMgr != nil {
+			var err error
+			diff, err = w.snapshotMgr.GenerateDiff(snapshotPath, newPath)
+			if err != nil {
+				// Diff generation failed - will fall back to full scan
+				diff = ""
+			}
+		}
+
+		// YARA scan - scoped to changed files when diff is available
+		verifyProgress.SetStatus(fmt.Sprintf("%s (yara)", pkg.Name))
+		if w.yaraEngine != nil {
+			var yaraResult *yara.DirScanResult
+			var err error
+
+			// If we have a diff, scan only the changed files
+			if diff != "" {
+				changedFiles := snapshot.ChangedFiles(diff, newPath)
+				if len(changedFiles) > 0 {
+					yaraResult, err = w.yaraEngine.ScanFiles(changedFiles)
+				} else {
+					// Empty diff means no text files changed - no YARA findings
+					yaraResult = &yara.DirScanResult{}
+				}
+			} else {
+				// No snapshot/diff available - fall back to full directory scan
+				// This happens during `bsau inspect` or if snapshot was skipped
+				yaraResult, err = w.yaraEngine.ScanDir(newPath)
+			}
+
 			if err != nil {
 				verifyProgress.Clear()
-				ui.PrintWarning(fmt.Sprintf("Semgrep scan failed for %s: %v", pkg.Name, err))
+				ui.PrintWarning(fmt.Sprintf("YARA scan failed for %s: %v", pkg.Name, err))
 				w.failures = append(w.failures, ui.ScanFailure{
 					Package: pkg.Name,
-					Step:    "Semgrep",
+					Step:    "YARA",
 					Error:   err.Error(),
 				})
 				if w.scanReport != nil {
-					w.scanReport.SetSemgrepScan(pkg.Name, "failed")
+					w.scanReport.SetYaraScan(pkg.Name, "failed")
 				}
 			} else {
-				lastSemgrepResult = semgrepResult
-				row.SemgrepCount = semgrepResult.FindingCount
-				if semgrepResult.HasFindings && row.Overall == "OK" {
+				lastYaraResult = yaraResult
+				row.YaraCount = yaraResult.FindingCount
+
+				// Check for ERROR severity findings - these hard-block without LLM
+				hasErrorFinding := false
+				for _, f := range yaraResult.Findings {
+					// Log all findings to log file
+					logger.YaraFinding(f.Path, f.RuleID, f.Severity)
+
+					// Verbose terminal output for each finding
+					lineNum := 0
+					if len(f.LineNumbers) > 0 {
+						lineNum = f.LineNumbers[0]
+					}
+					logger.VerboseYaraFinding(f.RuleID, f.Severity, f.Path, lineNum, f.Message)
+
+					if f.Severity == "ERROR" {
+						hasErrorFinding = true
+						verifyProgress.Clear()
+						lineInfo := ""
+						if lineNum > 0 {
+							lineInfo = fmt.Sprintf(":%d", lineNum)
+						}
+						ui.PrintError(fmt.Sprintf("YARA ERROR: %s in %s%s - %s", f.RuleID, f.Path, lineInfo, f.Message))
+					}
+				}
+
+				if hasErrorFinding {
+					row.Overall = "BLOCK"
+				} else if yaraResult.HasFindings && row.Overall == "OK" {
 					row.Overall = "REVIEW"
 				}
-				// Store semgrep results for saving
-				semgrepResultsMap[pkg.Name] = map[string]interface{}{
-					"finding_count": semgrepResult.FindingCount,
-					"has_findings":  semgrepResult.HasFindings,
-					"findings":      semgrepResult.Findings,
+
+				// Store YARA results for saving
+				yaraResultsMap[pkg.Name] = map[string]interface{}{
+					"finding_count": yaraResult.FindingCount,
+					"has_findings":  yaraResult.HasFindings,
+					"findings":      yaraResult.Findings,
+				}
+				// Store findings for display after table
+				if yaraResult.HasFindings {
+					yaraFindingsForDisplay[pkg.Name] = yaraFindingsWithPath{
+						Findings: yaraResult.Findings,
+						BasePath: newPath,
+					}
 				}
 				if w.scanReport != nil {
-					if semgrepResult.FindingCount > 0 {
-						w.scanReport.SetSemgrepScan(pkg.Name, fmt.Sprintf("%d findings", semgrepResult.FindingCount))
+					if yaraResult.FindingCount > 0 {
+						w.scanReport.SetYaraScan(pkg.Name, fmt.Sprintf("%d findings", yaraResult.FindingCount))
+						// Add detailed findings to report
+						reportFindings := make([]report.YaraFinding, len(yaraResult.Findings))
+						for i, f := range yaraResult.Findings {
+							reportFindings[i] = report.YaraFinding{
+								RuleID:      f.RuleID,
+								Path:        f.Path,
+								Severity:    f.Severity,
+								Message:     f.Message,
+								LineNumbers: f.LineNumbers,
+							}
+						}
+						w.scanReport.AddYaraFindings(pkg.Name, reportFindings)
 					} else {
-						w.scanReport.SetSemgrepScan(pkg.Name, "clean")
+						w.scanReport.SetYaraScan(pkg.Name, "clean")
 					}
 				}
 			}
 		} else if w.scanReport != nil {
-			w.scanReport.SetSemgrepScan(pkg.Name, "skipped")
+			w.scanReport.SetYaraScan(pkg.Name, "skipped")
 		}
 
-		// Diff and Ollama code analysis
-		if w.cfg.IsOllamaEnabled() && w.ollamaClient != nil {
-			// Generate diff if we have a snapshot
-			snapshotPath := w.runMgr.PackageSnapshotDir(pkg.Name, pkg.OldVersion)
-			newPath := w.brewClient.PackagePath(pkg.Name, pkg.NewVersion)
+		// Check if we should skip LLM due to YARA ERROR findings
+		skipLLMDueToYaraError := row.Overall == "BLOCK"
 
-			diff, err := w.snapshotMgr.GenerateDiff(snapshotPath, newPath)
-			if err == nil && diff != "" {
-				semgrepFindings := ""
-				if lastSemgrepResult != nil {
-					semgrepFindings = semgrep.FormatFindings(lastSemgrepResult.Findings)
+		// LLM code analysis - reuse the diff generated above
+		// Skip LLM if YARA found ERROR-severity findings (already hard-blocked)
+		verifyProgress.SetStatus(fmt.Sprintf("%s (llm)", pkg.Name))
+		if w.cfg.IsLLMEnabled() && w.llmProvider != nil && !skipLLMDueToYaraError {
+			if diff != "" {
+				yaraFindings := ""
+				if lastYaraResult != nil {
+					yaraFindings = yara.FormatFindings(lastYaraResult.Findings)
 				}
 
-				codeResult, err := w.ollamaClient.AnalyzeCode(pkg.Name, pkg.OldVersion, pkg.NewVersion, diff, semgrepFindings)
+				codeResult, err := w.llmProvider.AnalyzeCode(pkg.Name, pkg.OldVersion, pkg.NewVersion, diff, yaraFindings)
 				if err != nil {
-					ui.PrintWarning(fmt.Sprintf("OLLAMA LLM code analysis failed for %s: %v", pkg.Name, err))
+					ui.PrintWarning(fmt.Sprintf("LLM code analysis failed for %s: %v", pkg.Name, err))
 					w.failures = append(w.failures, ui.ScanFailure{
 						Package: pkg.Name,
-						Step:    "OLLAMA LLM Code",
+						Step:    "LLM Code",
 						Error:   err.Error(),
 					})
 					if w.scanReport != nil {
-						w.scanReport.SetOllamaMalwareScan(pkg.Name, "failed")
+						w.scanReport.SetLLMMalwareScan(pkg.Name, "failed")
 					}
 				} else {
-					row.OllamaVerdict = codeResult.Verdict
-					if codeResult.Verdict == ollama.VerdictHold {
-						if w.cfg.BlockPolicy.OllamaCodeHold {
+					row.LLMVerdict = codeResult.Verdict
+					if codeResult.Verdict == llm.VerdictHold {
+						if w.cfg.BlockPolicy.LLMCodeHold {
 							row.Overall = "BLOCK"
-							ui.PrintError(fmt.Sprintf("Package %s flagged by OLLAMA LLM - consider `brew uninstall %s`", pkg.Name, pkg.Name))
+							ui.PrintError(fmt.Sprintf("Package %s flagged by LLM - consider `brew uninstall %s`", pkg.Name, pkg.Name))
 						} else {
 							row.Overall = "REVIEW"
 						}
-					} else if codeResult.Verdict == ollama.VerdictReview && row.Overall == "OK" {
+					} else if codeResult.Verdict == llm.VerdictReview && row.Overall == "OK" {
 						row.Overall = "REVIEW"
 					}
+					// Store findings for display after table
+					if len(codeResult.Findings) > 0 {
+						llmFindingsForDisplay[pkg.Name] = codeResult.Findings
+					}
 					if w.scanReport != nil {
-						w.scanReport.SetOllamaMalwareScan(pkg.Name, string(codeResult.Verdict))
+						w.scanReport.SetLLMMalwareScan(pkg.Name, string(codeResult.Verdict))
+						// Add detailed findings to report
+						if len(codeResult.Findings) > 0 {
+							reportFindings := make([]report.LLMFinding, len(codeResult.Findings))
+							for i, f := range codeResult.Findings {
+								reportFindings[i] = report.LLMFinding{
+									File:        f.File,
+									LineNumber:  f.LineNumber,
+									Description: f.Description,
+								}
+							}
+							w.scanReport.AddLLMFindings(pkg.Name, reportFindings)
+						}
 					}
 				}
 			} else if w.scanReport != nil {
-				w.scanReport.SetOllamaMalwareScan(pkg.Name, "no diff")
+				w.scanReport.SetLLMMalwareScan(pkg.Name, "no diff")
+			}
+		} else if skipLLMDueToYaraError {
+			// LLM skipped because YARA found ERROR-severity findings
+			if w.scanReport != nil {
+				w.scanReport.SetLLMMalwareScan(pkg.Name, "skipped (YARA ERROR)")
 			}
 		} else if w.scanReport != nil {
-			w.scanReport.SetOllamaMalwareScan(pkg.Name, "skipped")
+			w.scanReport.SetLLMMalwareScan(pkg.Name, "skipped")
 		}
 
 		// Cleanup snapshot after analysis
@@ -679,18 +879,49 @@ func (w *Workflow) stepVerify(upgraded []upgradedPkg) ([]ui.PostInstallRow, erro
 		postInstallRows = append(postInstallRows, row)
 	}
 	verifyProgress.Done()
+	fmt.Println() // Blank line after progress
 
-	// Save semgrep results to run-scoped state
-	if len(semgrepResultsMap) > 0 {
-		if err := w.runMgr.SaveSemgrepResults(semgrepResultsMap); err != nil {
-			ui.PrintWarning(fmt.Sprintf("Failed to save semgrep results: %v", err))
+	// Save YARA results to run-scoped state
+	if len(yaraResultsMap) > 0 {
+		if err := w.runMgr.SaveYaraResults(yaraResultsMap); err != nil {
+			ui.PrintWarning(fmt.Sprintf("Failed to save YARA results: %v", err))
 		}
 	}
 
 	// === Post-update summary ===
 	ui.PrintInfo("Post-update summary:")
 	fmt.Println()
-	ui.RenderPostInstallTable(postInstallRows, w.cfg.IsOllamaEnabled())
+	ui.RenderPostInstallTable(postInstallRows, w.cfg.IsLLMEnabled())
+
+	// Display YARA findings details if any packages need review
+	if len(yaraFindingsForDisplay) > 0 {
+		fmt.Println()
+		ui.PrintWarning("YARA findings requiring review:")
+		for pkgName, data := range yaraFindingsForDisplay {
+			fmt.Printf("\n  %s:\n", pkgName)
+			fmt.Print(yara.FormatFindingsRelative(data.Findings, data.BasePath))
+		}
+		fmt.Println()
+	}
+
+	// Display LLM findings details if any packages need review
+	if len(llmFindingsForDisplay) > 0 {
+		fmt.Println()
+		ui.PrintWarning("LLM code analysis findings requiring review:")
+		for pkgName, findings := range llmFindingsForDisplay {
+			fmt.Printf("\n  %s (%d findings):\n", pkgName, len(findings))
+			for _, f := range findings {
+				if f.LineNumber > 0 {
+					fmt.Printf("    - %s:%d: %s\n", f.File, f.LineNumber, f.Description)
+				} else if f.File != "" {
+					fmt.Printf("    - %s: %s\n", f.File, f.Description)
+				} else {
+					fmt.Printf("    - %s\n", f.Description)
+				}
+			}
+		}
+		fmt.Println()
+	}
 
 	// Re-check vulnerabilities for summary using osv-scanner
 	cvesResolved := 0
@@ -748,6 +979,7 @@ func (w *Workflow) stepVerify(upgraded []upgradedPkg) ([]ui.PostInstallRow, erro
 func (w *Workflow) stepCleanup() error {
 	ui.PrintStep(7, 7, "Cleanup",
 		"Removing temporary files and running brew cleanup to free disk space.")
+	logger.StepHeader(7, 7, "Cleanup")
 
 	// Clean up temporary run directory (snapshots, state files)
 	ui.PrintInfo("Cleaning up temporary files...")
@@ -781,8 +1013,8 @@ func (w *Workflow) stepCleanup() error {
 	} else {
 		// Fallback if report not available
 		fmt.Printf("Vulnerability scan: completed\n")
-		fmt.Printf("Semgrep scan: %s\n", w.semgrepStatus)
-		fmt.Printf("Local LLM analysis: %s\n", w.ollamaStatus)
+		fmt.Printf("YARA scan: %s\n", w.yaraStatus)
+		fmt.Printf("LLM analysis: %s\n", w.llmStatus)
 	}
 
 	fmt.Println()
@@ -793,8 +1025,8 @@ func (w *Workflow) stepCleanup() error {
 
 func runWorkflow(cmd *cobra.Command, args []string) error {
 	// Apply CLI overrides
-	cfg.NoOllama = noOllama
-	cfg.NoSemgrep = noSemgrep
+	cfg.NoLLM = noLLM
+	cfg.NoYara = noYara
 	cfg.DryRun = dryRun
 
 	// Close logger at the end
