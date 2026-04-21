@@ -222,16 +222,11 @@ This creates `settings.yaml` next to the binary (e.g., `/usr/local/bin/settings.
 
 ```yaml
 features:
-  ollama_scan: true
+  llm_scan: true
+  llm_provider: ollama
 
-# LLM provider: "ollama" or "anthropic"
-llm_provider: ollama
-
-# Ollama server URL (default: http://localhost:11434)
-ollama_url: http://localhost:11434
-
-# Ollama model to use (REQUIRED when using ollama)
-ollama_model: gemma3  # or llama3, mistral, qwen2.5, etc.
+llm_url: http://localhost:11434
+llm_model: gemma3  # or llama3, mistral, qwen2.5, etc.
 ```
 
 Make sure Ollama is running:
@@ -245,13 +240,11 @@ ollama pull gemma3  # Download a model
 
 ```yaml
 features:
-  ollama_scan: true
+  llm_scan: true
+  llm_provider: anthropic
 
-# LLM provider: "ollama" or "anthropic"
-llm_provider: anthropic
-
-# Anthropic model (optional, defaults to claude-sonnet-4-6)
-anthropic_model: claude-sonnet-4-6
+# llm_model is optional for Anthropic (defaults to claude-sonnet-4-6)
+llm_model: claude-sonnet-4-6
 ```
 
 Set your API key as an environment variable:
@@ -264,14 +257,13 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| `features.ollama_scan` | Enable LLM analysis | `false` |
-| `llm_provider` | LLM provider: `ollama` or `anthropic` | `ollama` |
-| `ollama_url` | Ollama server URL | `http://localhost:11434` |
-| `ollama_model` | Ollama model name | (required) |
-| `anthropic_model` | Anthropic model name | `claude-sonnet-4-6` |
-| `ollama_max_file_bytes` | Max file size for LLM | `12000` |
-| `block_policy.ollama_formula_hold` | Block on formula HOLD | `true` |
-| `block_policy.ollama_code_hold` | Block on code HOLD | `true` |
+| `features.llm_scan` | Enable LLM analysis | `false` |
+| `features.llm_provider` | LLM provider: `ollama` or `anthropic` | `ollama` |
+| `llm_url` | LLM server URL (Ollama only) | `http://localhost:11434` |
+| `llm_model` | Model name (required for Ollama) | `""` |
+| `llm_max_file_bytes` | Max file size for LLM | `12000` |
+| `block_policy.llm_formula_hold` | Block on formula HOLD | `true` |
+| `block_policy.llm_code_hold` | Block on code HOLD | `true` |
 
 **File Locations**: `settings.yaml` and report files are stored in the same directory as the bsau binary. This makes the tool self-contained and easy to move.
 
@@ -450,12 +442,12 @@ bsau/
 │   ├── vuln/               # Vulnerability scanning (OSV, NVD)
 │   └── yara/               # YARA malware scanning
 │       └── rules/          # Embedded YARA rules (.yar files)
-├── settings.yaml           # Configuration file
-└── CLAUDE.md               # Development instructions
+└── settings.yaml           # Configuration file
 ```
 
 # TODO
 
+- Terraform tap path bug — hashicorp/tap/terraform installs to /opt/homebrew/Cellar/terraform/ not /opt/homebrew/Cellar/hashicorp/tap/terraform/
 - Better yara rules
 - Premature packages scanning (N+2)
 - Specific version installation support
